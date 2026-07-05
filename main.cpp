@@ -5,6 +5,11 @@
 #include <string>
 #include <vector>
 #include <cstdlib> // For getenv
+#include <map>
+#include <cstdint>
+#include <fstream>
+
+#include <asio.hpp>
 
 #include "ftxui/component/captured_mouse.hpp"
 #include "ftxui/component/component.hpp"
@@ -13,17 +18,85 @@
 #include "ftxui/dom/elements.hpp"
 
 using namespace ftxui;
+using asio::ip::udp;
 namespace fs = std::filesystem;
+
+struct FileTransfer {
+    uint32_t file_id{};
+    std::string file_path;
+    size_t total_size{};
+    size_t current_size{};
+};
 
 enum Screens {
     SCREEN_CONNECTION = 0,
     SCREEN_MAIN = 1,
-    SCREEN_FILE_DIALOG = 2
+    SCREEN_FILE_DIALOG = 2,
+    SCREEN_SETTINGS = 3
 };
 
 int main() {
     auto screen = ScreenInteractive::Fullscreen();
     int active_screen = SCREEN_CONNECTION;
+    int settings_previous_screen = SCREEN_CONNECTION;
+    int file_dialog_previous_screen = SCREEN_MAIN;
+
+    enum FileExplorerMode {
+        EXPLORER_SEND_FILE = 0,
+        EXPLORER_SELECT_DIR = 1
+    };
+    FileExplorerMode explorer_mode = EXPLORER_SEND_FILE;
+
+    auto get_home_dir = []() -> std::string {
+        if (const char* home = getenv("HOME")) return home;
+        if (const char* userprofile = getenv("USERPROFILE")) return userprofile;
+        const char* homedrive = getenv("HOMEDRIVE");
+        const char* homepath = getenv("HOMEPATH");
+        if (homedrive && homepath) return std::string(homedrive) + std::string(homepath);
+        return "";
+    };
+
+    // --- Settings State ---
+    std::string home = get_home_dir();
+    std::string settings_download_dir = fs::path(home) / "Documents" / "FileLighting";
+    auto load_settings = [&]() {
+        if (home.empty()) return;
+        fs::path settings_dir = fs::path(home) / "Documents" / "FileLighting";
+
+        if (fs::path settings_file = settings_dir / "settings.json"; fs::exists(settings_file)) {
+            std::ifstream in(settings_file);
+            std::string line;
+            while (std::getline(in, line)) {
+                auto pos = line.find("\"download_directory\"");
+                if (pos != std::string::npos) {
+                    auto colon = line.find(':', pos);
+                    if (colon != std::string::npos) {
+                        auto quote1 = line.find('\"', colon);
+                        if (quote1 != std::string::npos) {
+                            auto quote2 = line.find('\"', quote1 + 1);
+                            if (quote2 != std::string::npos) {
+                                settings_download_dir = line.substr(quote1 + 1, quote2 - quote1 - 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    auto save_settings = [&]() {
+        std::string home = get_home_dir();
+        if (home.empty()) return;
+        fs::path settings_dir = fs::path(home) / "Documents" / "FileLighting";
+        std::error_code ec;
+        fs::create_directories(settings_dir, ec);
+        
+        fs::path settings_file = settings_dir / "settings.json";
+        std::ofstream out(settings_file);
+        out << "{\n";
+        out << "  \"download_directory\": \"" << settings_download_dir << "\"\n";
+        out << "}\n";
+    };
+    load_settings();
 
     // --- State Variables ---
     std::string my_code = "Generating secure key...";
@@ -36,15 +109,33 @@ int main() {
     std::string current_loaded_path = fs::current_path().string();
     std::string path_input = current_loaded_path;
     std::string search_input;
-    std::string previous_search_input = "";
+    std::string previous_search_input;
 
     int selected_file_index = 0;
     int last_confirmed_index = -1;
 
     std::vector<std::string> chat_history;
-    std::vector<std::string> active_transfers;
+    std::map<uint32_t, FileTransfer> file_transfers;
     std::vector<std::string> all_directory_files;
     std::vector<std::string> current_directory_files;
+
+    // --- API Functions for your own system ---
+    auto api_update_secure_key = [&](const std::string& new_key) {
+        my_code = new_key;
+    };
+
+    auto api_add_chat_message = [&](const std::string& who, const std::string& message) {
+        chat_history.push_back(who + ": " + message);
+    };
+
+    auto api_update_file_transfer = [&](uint32_t file_id, const std::string& file_path, size_t total_size, size_t current_size) {
+        file_transfers[file_id] = {file_id, file_path, total_size, current_size};
+    };
+
+    auto api_remove_file_transfer = [&](uint32_t file_id) {
+        file_transfers.erase(file_id);
+    };
+    // -----------------------------------------
 
     // ==========================================
     // BACKEND LOGIC: FILE SYSTEM & SEARCH
@@ -82,12 +173,11 @@ int main() {
     auto load_directory = [&]() {
         current_loaded_path = path_input;
         all_directory_files.clear();
-        all_directory_files.push_back("..");
-
-        std::vector<std::string> directories;
-        std::vector<std::string> files;
+        all_directory_files.emplace_back("..");
 
         try {
+            std::vector<std::string> files;
+            std::vector<std::string> directories;
             for (const auto& entry : fs::directory_iterator(path_input)) {
                 std::string filename = entry.path().filename().string();
                 if (entry.is_directory()) {
@@ -104,7 +194,7 @@ int main() {
             all_directory_files.insert(all_directory_files.end(), files.begin(), files.end());
 
         } catch (const fs::filesystem_error& e) {
-            all_directory_files.push_back("<Access Denied>");
+            all_directory_files.emplace_back("<Access Denied>");
         }
 
         search_input.clear();
@@ -147,6 +237,12 @@ int main() {
         connect_btn_label = is_connecting ? "Cancel" : "Connect";
     }, safe_button);
 
+    Component btn_settings_conn_raw = Button("Settings", [&] {
+        settings_previous_screen = active_screen;
+        active_screen = SCREEN_SETTINGS;
+    }, safe_button);
+    Component btn_settings_conn = Maybe(btn_settings_conn_raw, [&] { return !is_connecting; });
+
     Component btn_force_start = Button("Force Start (Simulate Success)", [&] {
         active_screen = SCREEN_MAIN;
     }, safe_button);
@@ -154,6 +250,7 @@ int main() {
     auto connection_layout = Container::Vertical({
         conditional_input,
         btn_connect_cancel,
+        btn_settings_conn,
         btn_force_start
     });
 
@@ -174,6 +271,10 @@ int main() {
 
         bottom_elements.push_back(text("") | size(HEIGHT, EQUAL, 1));
         bottom_elements.push_back(btn_connect_cancel->Render() | size(WIDTH, EQUAL, 20) | hcenter);
+        
+        if (!is_connecting) {
+            bottom_elements.push_back(btn_settings_conn_raw->Render() | size(WIDTH, EQUAL, 20) | hcenter);
+        }
 
         return window(text(" P2P Setup "),
             vbox({
@@ -197,20 +298,32 @@ int main() {
     chat_input_option.multiline = false;
     chat_input_option.on_enter = [&] {
         if (!chat_input.empty()) {
-            chat_history.push_back("You: " + chat_input);
+            // TODO: Hook up your network send message here!
+            // e.g. send_message_over_network(chat_input);
+            
+            // You can optionally add it to history here immediately, or wait for network ACK:
+            // api_add_chat_message("You", chat_input);
+            
             chat_input.clear();
         }
     };
     Component input_chat = Input(&chat_input, "Type message...", chat_input_option);
 
     Component btn_browse = Button("Browse Files & Folders", [&] {
+        explorer_mode = EXPLORER_SEND_FILE;
+        file_dialog_previous_screen = active_screen;
         active_screen = SCREEN_FILE_DIALOG;
+    }, safe_button);
+
+    Component btn_settings_main = Button("Settings", [&] {
+        settings_previous_screen = active_screen;
+        active_screen = SCREEN_SETTINGS;
     }, safe_button);
 
     Component btn_exit = Button("Exit Application", screen.ExitLoopClosure(), safe_button);
 
     auto chat_container = Container::Vertical({ input_chat });
-    auto sidebar_actions = Container::Vertical({ btn_browse, btn_exit });
+    auto sidebar_actions = Container::Vertical({ btn_browse, btn_settings_main, btn_exit });
 
     auto main_screen_layout = Container::Horizontal({
         chat_container,
@@ -228,8 +341,16 @@ int main() {
 
     auto transfers_renderer = Renderer([&] {
         Elements elements;
-        for (const auto& transfer : active_transfers) {
-            elements.push_back(text(transfer));
+        for (const auto& [id, transfer] : file_transfers) {
+            float progress = transfer.total_size > 0 ? (float)transfer.current_size / transfer.total_size : 0.0f;
+            std::string percent_str = std::to_string(progress * 100);
+            percent_str = percent_str.substr(0, percent_str.find('.') + 2); // keep 1 decimal
+            std::string label = fs::path(transfer.file_path).filename().string() + " (" + percent_str + "%)";
+            
+            elements.push_back(hbox({
+                text(label) | flex,
+                gauge(progress) | size(WIDTH, EQUAL, 20)
+            }));
         }
         if (elements.empty()) elements.push_back(text("No active transfers") | dim);
         return vbox(std::move(elements)) | yframe | flex;
@@ -246,10 +367,11 @@ int main() {
             window(text(" Actions "),
                 vbox({
                     btn_browse->Render(),
+                    btn_settings_main->Render(),
                     filler(),
                     btn_exit->Render()
                 })
-            ) | size(HEIGHT, EQUAL, 9)
+            ) | size(HEIGHT, EQUAL, 12)
         });
 
         return window(text(" P2P Dashboard "),
@@ -273,9 +395,9 @@ int main() {
 
         // 1. Expand "~" to the user's home directory natively
         if (!target.empty() && target[0] == '~') {
-            const char* home = getenv("HOME");
-            if (home) {
-                target.replace(0, 1, std::string(home));
+            std::string home = get_home_dir();
+            if (!home.empty()) {
+                target.replace(0, 1, home);
             }
         }
 
@@ -331,9 +453,14 @@ int main() {
                 path_input = (fs::path(path_input) / selected_item).string();
                 load_directory();
             } else {
-                active_transfers.push_back("Queued: " + selected_item);
-                last_confirmed_index = -1;
-                active_screen = SCREEN_MAIN;
+                if (explorer_mode == EXPLORER_SEND_FILE) {
+                    // TODO: Hook up your network file send here!
+                    std::string full_path = (fs::path(path_input) / selected_item).string();
+                    // e.g. start_sending_file(full_path);
+                    
+                    last_confirmed_index = -1;
+                    active_screen = file_dialog_previous_screen;
+                }
             }
         } else {
             last_confirmed_index = selected_file_index;
@@ -342,15 +469,29 @@ int main() {
 
     Component file_menu = Menu(&current_directory_files, &selected_file_index, file_menu_option);
 
-    Component btn_cancel = Button("Cancel", [&] { active_screen = SCREEN_MAIN; }, safe_button);
+    Component btn_cancel = Button("Cancel", [&] { active_screen = file_dialog_previous_screen; }, safe_button);
     Component btn_confirm = Button("Confirm", [&] {
-        if (last_confirmed_index != -1 && last_confirmed_index < current_directory_files.size()) {
-            std::string selected_item = current_directory_files[last_confirmed_index];
-            if (selected_item.back() == '/') selected_item.pop_back();
+        if (explorer_mode == EXPLORER_SEND_FILE) {
+            if (last_confirmed_index != -1 && last_confirmed_index < current_directory_files.size()) {
+                std::string selected_item = current_directory_files[last_confirmed_index];
+                if (selected_item.back() == '/') selected_item.pop_back();
 
-            active_transfers.push_back("Queued: " + selected_item);
+                // TODO: Hook up your network file send here!
+                std::string full_path = (fs::path(path_input) / selected_item).string();
+                // e.g. start_sending_file(full_path);
+            }
+        } else {
+            std::string chosen_dir = path_input;
+            if (last_confirmed_index != -1 && last_confirmed_index < current_directory_files.size()) {
+                std::string selected_item = current_directory_files[last_confirmed_index];
+                if (selected_item.back() == '/') {
+                    selected_item.pop_back();
+                    chosen_dir = (fs::path(path_input) / selected_item).string();
+                }
+            }
+            settings_download_dir = chosen_dir;
         }
-        active_screen = SCREEN_MAIN;
+        active_screen = file_dialog_previous_screen;
     }, safe_button);
 
     auto file_dialog_layout = Container::Vertical({
@@ -388,12 +529,77 @@ int main() {
     });
 
     // ==========================================
+    // SCREEN 4: SETTINGS
+    // ==========================================
+    InputOption download_dir_option;
+    download_dir_option.multiline = false;
+    Component input_download_dir = Input(&settings_download_dir, "Download Directory...", download_dir_option);
+
+    Component btn_browse_download_dir = Button("Browse...", [&] {
+        explorer_mode = EXPLORER_SELECT_DIR;
+        file_dialog_previous_screen = active_screen;
+        active_screen = SCREEN_FILE_DIALOG;
+    }, safe_button);
+
+    Component btn_default_download_dir = Button("Default", [&] {
+        std::string home = get_home_dir();
+        settings_download_dir = (fs::path(home) / "Downloads" / "FileLighting").string();
+    }, safe_button);
+
+    Component btn_save_settings = Button("Save Settings", [&] {
+        save_settings();
+    }, safe_button);
+
+    Component btn_close_settings = Button("Back", [&] {
+        active_screen = settings_previous_screen;
+    }, safe_button);
+
+    auto dir_layout = Container::Horizontal({
+        input_download_dir,
+        btn_default_download_dir,
+        btn_browse_download_dir
+    });
+
+    auto buttons_layout = Container::Horizontal({
+        btn_close_settings,
+        btn_save_settings
+    });
+
+    auto settings_layout = Container::Vertical({
+        dir_layout,
+        buttons_layout
+    });
+
+    auto settings_renderer = Renderer(settings_layout, [&] {
+        return window(text(" Settings "),
+            vbox({
+                text("Settings Configuration") | hcenter | bold,
+                separator(),
+                window(text(" Download Directory "),
+                    hbox({
+                        input_download_dir->Render() | vcenter | flex,
+                        btn_default_download_dir->Render(),
+                        btn_browse_download_dir->Render()
+                    })
+                ),
+                filler(),
+                separator(),
+                hbox({
+                    btn_close_settings->Render(),
+                    btn_save_settings->Render()
+                }) | hcenter
+            })
+        ) | flex;
+    });
+
+    // ==========================================
     // MASTER CONTROLLER
     // ==========================================
     auto master_tabs = Container::Tab({
         connection_renderer,
         main_screen_renderer,
-        file_dialog_renderer
+        file_dialog_renderer,
+        settings_renderer
     }, &active_screen);
 
     auto global_renderer = CatchEvent(master_tabs, [&](Event event) {
