@@ -12,7 +12,7 @@ import xxhash
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 target_port = 5005
-target_ip = "127.0.0.1"
+target_ip = "172.104.105.130"
 
 pair_device_name = None
 request_device_name = None
@@ -137,8 +137,13 @@ def receive_response():
         elif data["type"] == "request_chunk":
             file_id = data["file_id"]
             chunk_num = data["chunk_num"]
+
             if file_id not in sending_buffer:
                 continue
+
+            # --- ADD THIS LINE TO COUNT THE DROP ---
+            sending_buffer[file_id]["dropped_packets"] += 1
+
             with open(sending_buffer[file_id]["file_path"], "rb") as file:
                 file.seek(chunk_num * CHUNK_SIZE)
                 chunk = file.read(CHUNK_SIZE)
@@ -206,8 +211,8 @@ def sending_thread(file_id):
                 s.sendto(header + chunk, (target_ip, target_port))
 
                 # OPTIMIZATION 2: Batch the network throttling (sleep every 100 packets)
-                if i % 100 == 0:
-                    time.sleep(0.001)
+                # if i % 100 == 0:
+                # time.sleep(0.001)
 
             # Announce block is finished
             checkpoint_msg = {
@@ -249,9 +254,13 @@ def sending_thread(file_id):
     # Final Transfer Stats
     total_time = time.perf_counter() - overall_start_time
     total_mb = (total_chunks * CHUNK_SIZE) / (1024 * 1024)
+    dropped = sending_buffer[file_id].get("dropped_packets", 0)  # <--- GET THE COUNT
+
     print(
         f"\n[Transfer Complete]: {total_mb:.2f} MB sent in {total_time:.2f}s (Avg: {total_mb / total_time:.2f} MB/s)"
     )
+    # --- PRINT THE NETWORK STATS ---
+    print(f"[Network Stats]: {dropped} packets were dropped and recovered.")
     print("Enter command: ", end="", flush=True)
 
     del sending_buffer[file_id]
@@ -353,10 +362,12 @@ while True:
         }
         s.sendto(json.dumps(message).encode(), (target_ip, target_port))
 
+        # ... inside command == "send file" ...
         sending_buffer[file_id] = {
             "file_path": file_path,
             "total_chunks": total_chunks,
             "ack": 0,
+            "dropped_packets": 0,  # <--- ADD THIS LINE
         }
 
         # FIXED: Start the background sending thread!
