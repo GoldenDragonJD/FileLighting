@@ -35,6 +35,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libsodium)
 
+# --- CLIP (Cross-Platform Clipboard) ---
+FetchContent_Declare(
+  clip
+  GIT_REPOSITORY https://github.com/dacap/clip.git
+  GIT_TAG        main
+)
+FetchContent_MakeAvailable(clip)
+
 # --- Executable ---
 add_executable(SendLighting main.cpp crypto_utils.cpp)
 
@@ -44,4 +52,9 @@ target_link_libraries(SendLighting
         PRIVATE ftxui::component
         PRIVATE asio_lib
         PRIVATE sodium
+        PRIVATE clip
 )
+
+if(WIN32)
+    target_link_libraries(SendLighting PRIVATE ws2_32 wsock32)
+endif()

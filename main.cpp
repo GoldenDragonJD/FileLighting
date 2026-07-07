@@ -8,9 +8,12 @@
 #include <map>
 #include <cstdint>
 #include <fstream>
+#include <thread>
 
 #include <asio.hpp>
 
+#include "crypto_utils.hpp"
+#include "stun_client.hpp"
 #include "ftxui/component/captured_mouse.hpp"
 #include "ftxui/component/component.hpp"
 #include "ftxui/component/component_base.hpp"
@@ -35,11 +38,29 @@ enum Screens {
     SCREEN_SETTINGS = 3
 };
 
+// --- Cross-platform clipboard utility ---
+#include "clip.h"
+
+void copy_to_clipboard(const std::string& text) {
+    clip::set_text(text);
+}
+
+void keep_port_open(udp::socket& shared_socket)
+{
+    while (true)
+    {
+
+    }
+}
+
 int main() {
     auto screen = ScreenInteractive::Fullscreen();
     int active_screen = SCREEN_CONNECTION;
     int settings_previous_screen = SCREEN_CONNECTION;
     int file_dialog_previous_screen = SCREEN_MAIN;
+
+    asio::io_context io_ctx;
+    std::vector<unsigned char> encryption_key = crypto::generate_key();
 
     enum FileExplorerMode {
         EXPLORER_SEND_FILE = 0,
@@ -58,7 +79,7 @@ int main() {
 
     // --- Settings State ---
     std::string home = get_home_dir();
-    std::string settings_download_dir = fs::path(home) / "Documents" / "FileLighting";
+    std::string settings_download_dir = (fs::path(home) / "Documents" / "FileLighting").string();
     auto load_settings = [&]() {
         if (home.empty()) return;
         fs::path settings_dir = fs::path(home) / "Documents" / "FileLighting";
@@ -229,6 +250,30 @@ int main() {
         }
     };
 
+    if (auto endpoint = stun::fetch_public_endpoint(io_ctx))
+    {
+        std::string secure_key = std::format("{}:{}:{}",
+            endpoint->ip,
+            endpoint->port,
+            std::string_view(reinterpret_cast<const char*>(encryption_key.data()), encryption_key.size())
+        );
+
+        size_t b64_len = sodium_base64_encoded_len(secure_key.size(), sodium_base64_VARIANT_URLSAFE);
+        std::string base64_key(b64_len, '\0');
+
+        sodium_bin2base64(
+            base64_key.data(), base64_key.size(),
+            reinterpret_cast<const unsigned char*>(secure_key.data()), secure_key.size(),
+            sodium_base64_VARIANT_URLSAFE
+        );
+
+        if (!base64_key.empty() && base64_key.back() == '\0') {
+            base64_key.pop_back();
+        }
+
+        api_update_secure_key(base64_key);
+    }
+
     Component input_peer_code = Input(&peer_code, "Enter peer code...", peer_input_option);
     Component conditional_input = Maybe(input_peer_code, [&] { return !is_connecting; });
 
@@ -247,7 +292,12 @@ int main() {
         active_screen = SCREEN_MAIN;
     }, safe_button);
 
+    Component btn_copy = Button("Copy", [&] {
+        copy_to_clipboard(my_code);
+    }, safe_button);
+
     auto connection_layout = Container::Vertical({
+        btn_copy,
         conditional_input,
         btn_connect_cancel,
         btn_settings_conn,
@@ -281,7 +331,11 @@ int main() {
                 filler(),
                 vbox({
                     text("Share this secure code with your peer:") | hcenter,
-                    text(my_code) | bold | hcenter | color(Color::Cyan),
+                    hbox({
+                        text(my_code) | bold | color(Color::Cyan) | vcenter,
+                        text("   ") | vcenter,
+                        btn_copy->Render()
+                    }) | hcenter,
                 }),
                 filler(),
                 separator(),
