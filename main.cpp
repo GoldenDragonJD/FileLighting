@@ -1,3 +1,4 @@
+#include <iostream>
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -49,6 +50,22 @@ enum Screens {
 #include "clip.h"
 
 void copy_to_clipboard(const std::string& text) {
+    // 1. Try to copy using OSC 52 (works over SSH in supported terminals)
+    size_t b64_len = sodium_base64_encoded_len(text.size(), sodium_base64_VARIANT_ORIGINAL);
+    std::string base64_text(b64_len, '\0');
+    sodium_bin2base64(
+        base64_text.data(), base64_text.size(),
+        reinterpret_cast<const unsigned char*>(text.data()), text.size(),
+        sodium_base64_VARIANT_ORIGINAL
+    );
+
+    if (!base64_text.empty() && base64_text.back() == '\0') {
+        base64_text.pop_back();
+    }
+    
+    std::cout << "\033]52;c;" << base64_text << "\a" << std::flush;
+
+    // 2. Fallback to local clipboard via clip.h for native environments
     clip::set_text(text);
 }
 
