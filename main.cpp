@@ -31,6 +31,13 @@ struct FileTransfer {
     size_t current_size{};
 };
 
+struct PeerInformation
+{
+    std::string ip;
+    uint16_t port{};
+    std::vector<char> security_key;
+};
+
 enum Screens {
     SCREEN_CONNECTION = 0,
     SCREEN_MAIN = 1,
@@ -45,19 +52,13 @@ void copy_to_clipboard(const std::string& text) {
     clip::set_text(text);
 }
 
-void keep_port_open(udp::socket& shared_socket)
-{
-    while (true)
-    {
-
-    }
-}
-
 int main() {
     auto screen = ScreenInteractive::Fullscreen();
     int active_screen = SCREEN_CONNECTION;
     int settings_previous_screen = SCREEN_CONNECTION;
     int file_dialog_previous_screen = SCREEN_MAIN;
+
+     auto peerInfo = PeerInformation();
 
     asio::io_context io_ctx;
     std::vector<unsigned char> encryption_key = crypto::generate_key();
@@ -110,7 +111,7 @@ int main() {
         fs::path settings_dir = fs::path(home) / "Documents" / "FileLighting";
         std::error_code ec;
         fs::create_directories(settings_dir, ec);
-        
+
         fs::path settings_file = settings_dir / "settings.json";
         std::ofstream out(settings_file);
         out << "{\n";
@@ -241,46 +242,105 @@ int main() {
     // ==========================================
     // SCREEN 1: CONNECTION
     // ==========================================
-    InputOption peer_input_option;
-    peer_input_option.multiline = false;
-    peer_input_option.on_enter = [&] {
-        if (!peer_code.empty()) {
+    auto toggle_connection = [&] {
+        if (!is_connecting)
+        {
+            if (peer_code.empty()) return;
+
+            std::vector<unsigned char> decoded_bin(peer_code.size());
+            size_t decoded_len = 0;
+            if (sodium_base642bin(
+                decoded_bin.data(), decoded_bin.size(),
+                peer_code.data(), peer_code.size(),
+                " \n\r\t", &decoded_len, nullptr,
+                sodium_base64_VARIANT_URLSAFE) != 0) 
+            {
+                // Failed to decode
+                return;
+            }
+            
+            std::string peer_decoded(reinterpret_cast<char*>(decoded_bin.data()), decoded_len);
+
+            size_t first_colon = peer_decoded.find(':');
+            size_t second_colon = peer_decoded.find(':', first_colon + 1);
+
+            if (first_colon != std::string::npos && second_colon != std::string::npos) {
+                peerInfo.ip = peer_decoded.substr(0, first_colon);
+                try {
+                    peerInfo.port = static_cast<uint16_t>(std::stoul(peer_decoded.substr(first_colon + 1, second_colon - first_colon - 1)));
+                } catch (...) {
+                    return; // Invalid port
+                }
+                
+                std::string key_str = peer_decoded.substr(second_colon + 1);
+                peerInfo.security_key.assign(key_str.begin(), key_str.end());
+            } else {
+                return; // Invalid format
+            }
+
             is_connecting = true;
             connect_btn_label = "Cancel";
         }
+        else if (is_connecting)
+        {
+            is_connecting = false;
+            connect_btn_label = "Connect";
+        }
     };
 
-    if (auto endpoint = stun::fetch_public_endpoint(io_ctx))
+    InputOption peer_input_option;
+    peer_input_option.multiline = false;
+    peer_input_option.on_enter = toggle_connection;
+
+    std::thread start_ping_thread([&]
     {
-        std::string secure_key = std::format("{}:{}:{}",
-            endpoint->ip,
-            endpoint->port,
-            std::string_view(reinterpret_cast<const char*>(encryption_key.data()), encryption_key.size())
-        );
+        while (true)
+        {
+            if (!is_connecting)
+            {
+                if (auto endpoint = stun::fetch_public_endpoint(io_ctx))
+                {
+                    std::string secure_key = std::format("{}:{}:{}",
+                        endpoint->ip,
+                        endpoint->port,
+                        std::string_view(reinterpret_cast<const char*>(encryption_key.data()), encryption_key.size())
+                    );
 
-        size_t b64_len = sodium_base64_encoded_len(secure_key.size(), sodium_base64_VARIANT_URLSAFE);
-        std::string base64_key(b64_len, '\0');
+                    size_t b64_len = sodium_base64_encoded_len(secure_key.size(), sodium_base64_VARIANT_URLSAFE);
+                    std::string base64_key(b64_len, '\0');
 
-        sodium_bin2base64(
-            base64_key.data(), base64_key.size(),
-            reinterpret_cast<const unsigned char*>(secure_key.data()), secure_key.size(),
-            sodium_base64_VARIANT_URLSAFE
-        );
+                    sodium_bin2base64(
+                        base64_key.data(), base64_key.size(),
+                        reinterpret_cast<const unsigned char*>(secure_key.data()), secure_key.size(),
+                        sodium_base64_VARIANT_URLSAFE
+                    );
 
-        if (!base64_key.empty() && base64_key.back() == '\0') {
-            base64_key.pop_back();
+                    if (!base64_key.empty() && base64_key.back() == '\0') {
+                        base64_key.pop_back();
+                    }
+
+                    api_update_secure_key(base64_key);
+                    screen.PostEvent(Event::Custom);
+                    std::this_thread::sleep_for(std::chrono::seconds(25));
+                }
+                else
+                {
+                    break;
+                }
+            }
+            else
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            }
         }
+    });
 
-        api_update_secure_key(base64_key);
-    }
+    start_ping_thread.detach();
 
     Component input_peer_code = Input(&peer_code, "Enter peer code...", peer_input_option);
     Component conditional_input = Maybe(input_peer_code, [&] { return !is_connecting; });
 
-    Component btn_connect_cancel = Button(&connect_btn_label, [&] {
-        is_connecting = !is_connecting;
-        connect_btn_label = is_connecting ? "Cancel" : "Connect";
-    }, safe_button);
+    Component btn_connect_cancel = Button(&connect_btn_label, toggle_connection, safe_button);
 
     Component btn_settings_conn_raw = Button("Settings", [&] {
         settings_previous_screen = active_screen;
@@ -306,7 +366,7 @@ int main() {
 
     auto connection_renderer = Renderer(connection_layout, [&] {
         auto status_text = is_connecting
-            ? text("Status: Connecting... Waiting for hole punch") | color(Color::Yellow)
+            ? text("Status: Connecting to " + peerInfo.ip + ":" + std::to_string(peerInfo.port) + " Waiting for hole punch") | color(Color::Yellow)
             : text("Status: Idle") | color(Color::Green);
 
         Elements bottom_elements;
@@ -657,7 +717,7 @@ int main() {
     }, &active_screen);
 
     auto global_renderer = CatchEvent(master_tabs, [&](Event event) {
-        if (event == Event::Escape || event == Event::Character('q')) {
+        if (event == Event::Escape) {
             screen.ExitLoopClosure()();
             return true;
         }

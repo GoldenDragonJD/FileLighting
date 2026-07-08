@@ -2,9 +2,6 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build-win/_deps/clip-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build-win/_deps/libsodium-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build-win/_deps/libsodium-src/libsodium" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/clip-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/libsodium-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/libsodium-src/libsodium" vcs="Git" />
