@@ -99,6 +99,13 @@ int main() {
 
     auto peerInfo = PeerInformation();
 
+    asio::io_context io_ctx;
+    std::vector<unsigned char> encryption_key = crypto::generate_key();
+    
+    // Create the UDP socket to be reused for STUN and P2P communication.
+    // Binding to port 0 means the OS will choose an ephemeral port for us.
+    udp::socket p2p_socket(io_ctx, udp::endpoint(udp::v4(), 0));
+
     // --- Reliable Network State ---
     std::mutex queue_mutex;
     uint32_t next_sequence_number = 1;
@@ -136,13 +143,6 @@ int main() {
         std::lock_guard<std::mutex> lock(queue_mutex);
         outbound_queue.push_back(msg);
     };
-
-    asio::io_context io_ctx;
-    std::vector<unsigned char> encryption_key = crypto::generate_key();
-    
-    // Create the UDP socket to be reused for STUN and P2P communication.
-    // Binding to port 0 means the OS will choose an ephemeral port for us.
-    udp::socket p2p_socket(io_ctx, udp::endpoint(udp::v4(), 0));
 
     enum FileExplorerMode {
         EXPLORER_SEND_FILE = 0,
