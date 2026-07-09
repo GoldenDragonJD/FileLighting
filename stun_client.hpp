@@ -29,7 +29,7 @@ struct PublicEndpoint {
 };
 
 // Utility function to fetch the public IP and port from STUN servers
-inline std::optional<PublicEndpoint> fetch_public_endpoint(asio::io_context& io_ctx) {
+inline std::optional<PublicEndpoint> fetch_public_endpoint(asio::io_context& io_ctx, asio::ip::udp::socket& sock) {
     using asio::ip::udp;
 
     std::vector<std::pair<std::string, std::string>> stun_servers = {
@@ -47,10 +47,7 @@ inline std::optional<PublicEndpoint> fetch_public_endpoint(asio::io_context& io_
             
             udp::endpoint stun_endpoint = *endpoints.begin();
 
-            // 2. Open an ephemeral UDP socket
-            udp::socket sock(io_ctx, udp::endpoint(udp::v4(), 0));
-
-            // 3. Construct the 20-byte STUN Binding Request packet manually
+            // 2. Construct the 20-byte STUN Binding Request packet manually
             std::vector<uint8_t> request(20, 0);
             
             // Message Type: 0x0001 (Binding Request) in network byte order (Big Endian)
@@ -70,7 +67,7 @@ inline std::optional<PublicEndpoint> fetch_public_endpoint(asio::io_context& io_
             sock.send_to(asio::buffer(request), stun_endpoint);
 
             // 5. Read the response packet
-            std::array<uint8_t, 1024> recv_buffer;
+            std::array<uint8_t, 1024> recv_buffer{};
             udp::endpoint sender_endpoint;
             asio::error_code ec;
             size_t len = sock.receive_from(asio::buffer(recv_buffer), sender_endpoint, 0, ec);

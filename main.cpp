@@ -39,6 +39,23 @@ struct PeerInformation
     std::vector<char> security_key;
 };
 
+enum class MessageType : uint8_t {
+    PING = 0,
+    TEXT_MESSAGE = 1,
+    FILE_METADATA = 2,
+    FILE_DATA = 3,
+    ACK = 4
+};
+
+struct BufferedMessage {
+    uint32_t sequence_number;
+    std::vector<unsigned char> payload;
+    std::chrono::steady_clock::time_point send_time;
+    bool in_flight = false;
+    int retries = 0;
+    bool is_ack = false;
+};
+
 enum Screens {
     SCREEN_CONNECTION = 0,
     SCREEN_MAIN = 1,
@@ -75,10 +92,52 @@ int main() {
     int settings_previous_screen = SCREEN_CONNECTION;
     int file_dialog_previous_screen = SCREEN_MAIN;
 
-     auto peerInfo = PeerInformation();
+    auto peerInfo = PeerInformation();
+
+    // --- Reliable Network State ---
+    std::mutex queue_mutex;
+    uint32_t next_sequence_number = 1;
+    std::vector<BufferedMessage> outbound_queue;
+    double srtt_ms = 500.0;
+    double rttvar_ms = 250.0;
+
+    auto enqueue_message = [&](MessageType type, const std::string& data) {
+        if (peerInfo.security_key.empty()) return;
+        
+        std::vector<unsigned char> plaintext;
+        plaintext.push_back(static_cast<uint8_t>(type));
+        
+        uint32_t seq;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            seq = next_sequence_number++;
+        }
+        
+        plaintext.push_back((seq >> 24) & 0xFF);
+        plaintext.push_back((seq >> 16) & 0xFF);
+        plaintext.push_back((seq >> 8) & 0xFF);
+        plaintext.push_back(seq & 0xFF);
+        
+        plaintext.insert(plaintext.end(), data.begin(), data.end());
+        
+        std::vector<unsigned char> key(peerInfo.security_key.begin(), peerInfo.security_key.end());
+        std::vector<unsigned char> encrypted_payload = crypto::encrypt_data(plaintext, key);
+        
+        BufferedMessage msg;
+        msg.sequence_number = seq;
+        msg.payload = encrypted_payload;
+        msg.is_ack = (type == MessageType::ACK);
+        
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        outbound_queue.push_back(msg);
+    };
 
     asio::io_context io_ctx;
     std::vector<unsigned char> encryption_key = crypto::generate_key();
+    
+    // Create the UDP socket to be reused for STUN and P2P communication.
+    // Binding to port 0 means the OS will choose an ephemeral port for us.
+    udp::socket p2p_socket(io_ctx, udp::endpoint(udp::v4(), 0));
 
     enum FileExplorerMode {
         EXPLORER_SEND_FILE = 0,
@@ -309,13 +368,21 @@ int main() {
     peer_input_option.multiline = false;
     peer_input_option.on_enter = toggle_connection;
 
-    std::thread start_ping_thread([&]
+
+    // This is the thread that controls pinging.
+
+    std::thread network_thread([&]
     {
+        uint32_t last_processed_seq = 0;
+
         while (true)
         {
             if (!is_connecting)
             {
-                if (auto endpoint = stun::fetch_public_endpoint(io_ctx))
+                // Make sure socket is blocking for STUN
+                p2p_socket.non_blocking(false); 
+                
+                if (auto endpoint = stun::fetch_public_endpoint(io_ctx, p2p_socket))
                 {
                     std::string secure_key = std::format("{}:{}:{}",
                         endpoint->ip,
@@ -342,17 +409,118 @@ int main() {
                 }
                 else
                 {
+                    api_update_secure_key("Unable to reach STUN server.");
+                    screen.PostEvent(Event::Custom);
                     break;
                 }
             }
             else
             {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+                // Switch to non-blocking for P2P loop
+                p2p_socket.non_blocking(true); 
+
+                // --- 1. RECEIVE PACKETS ---
+                std::array<uint8_t, 65536> recv_buffer;
+                udp::endpoint sender_endpoint;
+                asio::error_code ec;
+                
+                size_t len = p2p_socket.receive_from(asio::buffer(recv_buffer), sender_endpoint, 0, ec);
+                if (!ec && len > 0) {
+                    try {
+                        std::vector<unsigned char> encrypted_data(recv_buffer.begin(), recv_buffer.begin() + len);
+                        std::vector<unsigned char> key(peerInfo.security_key.begin(), peerInfo.security_key.end());
+                        std::vector<unsigned char> decrypted_data = crypto::decrypt_data(encrypted_data, key);
+                        
+                        if (decrypted_data.size() >= 5) {
+                            MessageType type = static_cast<MessageType>(decrypted_data[0]);
+                            uint32_t seq = (decrypted_data[1] << 24) | (decrypted_data[2] << 16) | (decrypted_data[3] << 8) | decrypted_data[4];
+                            std::string payload(decrypted_data.begin() + 5, decrypted_data.end());
+                            
+                            if (type == MessageType::ACK) {
+                                uint32_t acked_seq = 0;
+                                if (payload.size() == 4) {
+                                    acked_seq = (static_cast<uint8_t>(payload[0]) << 24) |
+                                                (static_cast<uint8_t>(payload[1]) << 16) |
+                                                (static_cast<uint8_t>(payload[2]) << 8) |
+                                                static_cast<uint8_t>(payload[3]);
+                                }
+                                
+                                std::lock_guard<std::mutex> lock(queue_mutex);
+                                if (!outbound_queue.empty() && outbound_queue.front().sequence_number == acked_seq) {
+                                    outbound_queue.erase(outbound_queue.begin()); // Successfully delivered!
+                                }
+                            } else {
+                                // Reconstruct the ACK payload (the sequence number we just received)
+                                std::string ack_payload;
+                                ack_payload.push_back(decrypted_data[1]);
+                                ack_payload.push_back(decrypted_data[2]);
+                                ack_payload.push_back(decrypted_data[3]);
+                                ack_payload.push_back(decrypted_data[4]);
+                                
+                                if (seq <= last_processed_seq) {
+                                    // It's a duplicate! We already processed it. Just send the ACK back.
+                                    enqueue_message(MessageType::ACK, ack_payload);
+                                } else {
+                                    // It's a brand new message!
+                                    last_processed_seq = seq;
+                                    
+                                    // --- PROCESS THE MESSAGE DATA ---
+                                    if (type == MessageType::TEXT_MESSAGE) {
+                                        api_add_chat_message("Peer", payload);
+                                        screen.PostEvent(Event::Custom);
+                                    }
+                                    
+                                    // ... handle other types here ...
+
+                                    // Finally, send the ACK!
+                                    enqueue_message(MessageType::ACK, ack_payload);
+                                }
+                            }
+                        }
+                    } catch (...) {
+                        // Decryption failed or garbage packet, ignore
+                    }
+                }
+
+                // --- 2. SEND PACKETS (Stop-and-Wait ARQ) ---
+                auto now = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                
+                // Prioritize sending ACKs immediately
+                for (auto it = outbound_queue.begin(); it != outbound_queue.end(); ) {
+                    if (it->is_ack) {
+                        asio::error_code send_ec;
+                        udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
+                        p2p_socket.send_to(asio::buffer(it->payload), peer_endp, 0, send_ec);
+                        it = outbound_queue.erase(it); // Remove immediately, ACKs don't get retried
+                    } else {
+                        ++it;
+                    }
+                }
+                
+                // Process the reliable queue (Stop-and-Wait: only look at the very front of the queue)
+                if (!outbound_queue.empty()) {
+                    auto& msg = outbound_queue.front();
+                    auto timeout = std::chrono::milliseconds(static_cast<int>(srtt_ms + 4 * rttvar_ms));
+                    
+                    if (!msg.in_flight || (now - msg.send_time) > timeout) {
+                        asio::error_code send_ec;
+                        udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
+                        p2p_socket.send_to(asio::buffer(msg.payload), peer_endp, 0, send_ec);
+                        
+                        msg.send_time = now;
+                        msg.in_flight = true;
+                        msg.retries++;
+                    }
+                }
+                
+                // Sleep briefly to prevent pinning the CPU at 100%
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
     });
 
-    start_ping_thread.detach();
+    network_thread.detach();
 
     Component input_peer_code = Input(&peer_code, "Enter peer code...", peer_input_option);
     Component conditional_input = Maybe(input_peer_code, [&] { return !is_connecting; });
@@ -429,12 +597,12 @@ int main() {
     chat_input_option.multiline = false;
     chat_input_option.on_enter = [&] {
         if (!chat_input.empty()) {
-            // TODO: Hook up your network send message here!
-            // e.g. send_message_over_network(chat_input);
             
-            // You can optionally add it to history here immediately, or wait for network ACK:
-            // api_add_chat_message("You", chat_input);
+            // Queue the message to be sent over the reliable network
+            enqueue_message(MessageType::TEXT_MESSAGE, chat_input);
             
+            // Show it locally
+            api_add_chat_message("You", chat_input);
             chat_input.clear();
         }
     };

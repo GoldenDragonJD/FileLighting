@@ -44,9 +44,9 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(clip)
 
 # --- Executable ---
-add_executable(SendLighting main.cpp crypto_utils.cpp)
+add_executable(FileLighting main.cpp crypto_utils.cpp)
 
-target_link_libraries(SendLighting
+target_link_libraries(FileLighting
         PRIVATE ftxui::screen
         PRIVATE ftxui::dom
         PRIVATE ftxui::component
@@ -56,5 +56,5 @@ target_link_libraries(SendLighting
 )
 
 if(WIN32)
-    target_link_libraries(SendLighting PRIVATE ws2_32 wsock32)
+    target_link_libraries(FileLighting PRIVATE ws2_32 wsock32)
 endif()
