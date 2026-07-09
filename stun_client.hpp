@@ -121,4 +121,18 @@ inline std::optional<PublicEndpoint> fetch_public_endpoint(asio::io_context& io_
     return std::nullopt; // All servers failed
 }
 
+// Utility function to fetch the local LAN IP and port for local connections
+inline std::optional<PublicEndpoint> fetch_local_endpoint(asio::io_context& io_ctx, asio::ip::udp::socket& p2p_socket) {
+    try {
+        // We connect a dummy socket to a public IP to force the OS to resolve our primary local LAN IP
+        asio::ip::udp::socket temp_socket(io_ctx);
+        temp_socket.connect(asio::ip::udp::endpoint(asio::ip::make_address("8.8.8.8"), 53));
+        std::string local_ip = temp_socket.local_endpoint().address().to_string();
+        uint16_t local_port = p2p_socket.local_endpoint().port();
+        return PublicEndpoint{local_ip, local_port};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 } // namespace stun

@@ -44,7 +44,8 @@ enum class MessageType : uint8_t {
     TEXT_MESSAGE = 1,
     FILE_METADATA = 2,
     FILE_DATA = 3,
-    ACK = 4
+    ACK = 4,
+    DISCONNECT = 5
 };
 
 struct BufferedMessage {
@@ -206,7 +207,9 @@ int main() {
     std::string peer_code;
     std::string chat_input;
     bool is_connecting = false;
+    bool is_local_mode = false;
     std::string connect_btn_label = "Connect";
+    std::string toggle_btn_label = "Mode: Public Internet (Use STUN)";
 
     // File Explorer State
     std::string current_loaded_path = fs::current_path().string();
@@ -388,15 +391,28 @@ int main() {
     std::thread network_thread([&]
     {
         uint32_t last_processed_seq = 0;
+        auto last_receive_time = std::chrono::steady_clock::now();
+        auto last_ping_send_time = std::chrono::steady_clock::now();
 
         while (true)
         {
             if (!is_connecting)
             {
                 // Make sure socket is blocking for STUN
-                p2p_socket.non_blocking(false); 
+                p2p_socket.non_blocking(false);
                 
-                if (auto endpoint = stun::fetch_public_endpoint(io_ctx, p2p_socket))
+                // Keep timestamps fresh while in the lobby so it doesn't instantly timeout upon connecting
+                last_receive_time = std::chrono::steady_clock::now();
+                last_ping_send_time = std::chrono::steady_clock::now();
+                
+                std::optional<stun::PublicEndpoint> endpoint;
+                if (is_local_mode) {
+                    endpoint = stun::fetch_local_endpoint(io_ctx, p2p_socket);
+                } else {
+                    endpoint = stun::fetch_public_endpoint(io_ctx, p2p_socket);
+                }
+                
+                if (endpoint)
                 {
                     std::string secure_key = std::format("{}:{}:{}",
                         endpoint->ip,
@@ -419,13 +435,31 @@ int main() {
 
                     api_update_secure_key(base64_key);
                     screen.PostEvent(Event::Custom);
-                    std::this_thread::sleep_for(std::chrono::seconds(25));
+                    
+                    bool was_local = is_local_mode;
+                    for (int i = 0; i < 250 && !is_connecting; ++i) {
+                        if (was_local != is_local_mode) {
+                            my_code = "Generating secure key...";
+                            screen.PostEvent(Event::Custom);
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
                 }
                 else
                 {
-                    api_update_secure_key("Unable to reach STUN server.");
+                    api_update_secure_key(is_local_mode ? "Unable to get local IP." : "Unable to reach STUN server.");
                     screen.PostEvent(Event::Custom);
-                    break;
+                    
+                    bool was_local = is_local_mode;
+                    for (int i = 0; i < 50 && !is_connecting; ++i) {
+                        if (was_local != is_local_mode) {
+                            my_code = "Generating secure key...";
+                            screen.PostEvent(Event::Custom);
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
                 }
             }
             else
@@ -439,7 +473,13 @@ int main() {
                 asio::error_code ec;
                 
                 size_t len = p2p_socket.receive_from(asio::buffer(recv_buffer), sender_endpoint, 0, ec);
+                
+                auto now = std::chrono::steady_clock::now();
+                
                 if (!ec && len > 0) {
+                    // We received a packet, the connection is alive!
+                    last_receive_time = now;
+                    
                     try {
                         std::vector<unsigned char> encrypted_data(recv_buffer.begin(), recv_buffer.begin() + len);
                         std::vector<unsigned char> key(peerInfo.security_key.begin(), peerInfo.security_key.end());
@@ -494,6 +534,23 @@ int main() {
                                     if (type == MessageType::TEXT_MESSAGE) {
                                         api_add_chat_message("Peer", payload);
                                         screen.PostEvent(Event::Custom);
+                                    } else if (type == MessageType::DISCONNECT) {
+                                        // The peer intentionally disconnected! Drop back to lobby instantly.
+                                        is_connecting = false;
+                                        connect_btn_label = "Connect";
+                                        active_screen = SCREEN_CONNECTION;
+                                        peer_code.clear();
+                                        my_code = "Generating secure key...";
+                                        chat_history.clear();
+                                        file_transfers.clear();
+                                        
+                                        {
+                                            std::lock_guard<std::mutex> lock(queue_mutex);
+                                            outbound_queue.clear();
+                                            next_sequence_number = 1;
+                                        }
+                                        last_processed_seq = 0;
+                                        screen.PostEvent(Event::Custom);
                                     }
                                     
                                     // ... handle other types here ...
@@ -505,6 +562,42 @@ int main() {
                         }
                     } catch (...) {
                         // Decryption failed or garbage packet, ignore
+                    }
+                }
+                
+                // --- 1.5 DISCONNECT DETECTION & KEEPALIVES ---
+                
+                // If we are fully connected but haven't received ANY packet for 15 seconds, assume disconnect
+                if (active_screen == SCREEN_MAIN && (now - last_receive_time) > std::chrono::seconds(15)) {
+                    is_connecting = false;
+                    connect_btn_label = "Connect";
+                    active_screen = SCREEN_CONNECTION;
+                    peer_code.clear();
+                    my_code = "Generating secure key...";
+                    chat_history.clear();
+                    file_transfers.clear();
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex);
+                        outbound_queue.clear();
+                        next_sequence_number = 1;
+                    }
+                    last_processed_seq = 0;
+                    
+                    screen.PostEvent(Event::Custom);
+                    continue; // Skip the rest of the loop and restart as disconnected
+                }
+                
+                // If the connection is idle (queue is empty) for 5 seconds, send a keepalive PING
+                if (active_screen == SCREEN_MAIN && (now - last_ping_send_time) > std::chrono::seconds(5)) {
+                    bool queue_is_empty;
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex);
+                        queue_is_empty = outbound_queue.empty();
+                    }
+                    if (queue_is_empty) {
+                        enqueue_message(MessageType::PING, "PING");
+                        last_ping_send_time = now;
                     }
                 }
 
@@ -550,8 +643,14 @@ int main() {
 
     network_thread.detach();
 
-    Component input_peer_code = Input(&peer_code, "Enter peer code...", peer_input_option);
+    Component input_peer_code = Input(&peer_code, "Paste Peer Code Here", peer_input_option) | border;
     Component conditional_input = Maybe(input_peer_code, [&] { return !is_connecting; });
+    
+    Component btn_toggle_local = Button(&toggle_btn_label, [&] {
+        is_local_mode = !is_local_mode;
+        toggle_btn_label = is_local_mode ? "Mode: Local Network (Bypass STUN)" : "Mode: Public Internet (Use STUN)";
+    }, safe_button);
+    Component conditional_toggle = Maybe(btn_toggle_local, [&] { return !is_connecting; });
 
     Component btn_connect_cancel = Button(&connect_btn_label, toggle_connection, safe_button);
 
@@ -572,6 +671,7 @@ int main() {
     auto connection_layout = Container::Vertical({
         btn_copy,
         conditional_input,
+        conditional_toggle,
         btn_connect_cancel,
         btn_settings_conn,
         btn_force_start
@@ -588,12 +688,14 @@ int main() {
 
         if (!is_connecting) {
             bottom_elements.push_back(input_peer_code->Render() | size(WIDTH, EQUAL, 35) | hcenter);
+            bottom_elements.push_back(text("") | size(HEIGHT, EQUAL, 1));
+            bottom_elements.push_back(btn_toggle_local->Render() | hcenter);
         } else {
-            bottom_elements.push_back(text("") | size(HEIGHT, EQUAL, 3));
+            bottom_elements.push_back(text("") | size(HEIGHT, EQUAL, 5));
         }
 
         bottom_elements.push_back(text("") | size(HEIGHT, EQUAL, 1));
-        bottom_elements.push_back(btn_connect_cancel->Render() | size(WIDTH, EQUAL, 20) | hcenter);
+        bottom_elements.push_back(btn_connect_cancel->Render() | hcenter);
         
         if (!is_connecting) {
             bottom_elements.push_back(btn_settings_conn_raw->Render() | size(WIDTH, EQUAL, 20) | hcenter);
@@ -603,7 +705,7 @@ int main() {
             vbox({
                 filler(),
                 vbox({
-                    text("Share this secure code with your peer:") | hcenter,
+                    text(is_local_mode ? "Share this LOCAL secure code with your peer:" : "Share this PUBLIC secure code with your peer:") | hcenter,
                     hbox({
                         text(my_code) | bold | color(Color::Cyan) | vcenter,
                         text("   ") | vcenter,
@@ -612,7 +714,7 @@ int main() {
                 }),
                 filler(),
                 separator(),
-                vbox(bottom_elements) | size(HEIGHT, EQUAL, 10),
+                vbox(bottom_elements),
                 btn_force_start->Render() | size(WIDTH, EQUAL, 35) | hcenter
             })
         ) | flex;
@@ -938,5 +1040,39 @@ int main() {
     });
 
     screen.Loop(global_renderer);
+    
+    // --- GRACEFUL SHUTDOWN: SEND DISCONNECT PACKET ---
+    // This executes when the user clicks Exit Application, hits Escape, or uses Ctrl+C
+    if (is_connecting && !peerInfo.ip.empty()) {
+        try {
+            std::vector<unsigned char> plaintext;
+            plaintext.push_back(static_cast<uint8_t>(MessageType::DISCONNECT));
+            
+            uint32_t seq;
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                seq = next_sequence_number++;
+            }
+            
+            plaintext.push_back((seq >> 24) & 0xFF);
+            plaintext.push_back((seq >> 16) & 0xFF);
+            plaintext.push_back((seq >> 8) & 0xFF);
+            plaintext.push_back(seq & 0xFF);
+            
+            std::vector<unsigned char> encrypted_payload = crypto::encrypt_data(plaintext, encryption_key);
+            
+            asio::error_code send_ec;
+            udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
+            
+            // Blast it 3 times just to be absolutely sure they get it before we die, since we can't stick around to wait for an ACK
+            for (int i = 0; i < 3; ++i) {
+                p2p_socket.send_to(asio::buffer(encrypted_payload), peer_endp, 0, send_ec);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        } catch (...) {
+            // Ignore shutdown errors
+        }
+    }
+
     return 0;
 }
