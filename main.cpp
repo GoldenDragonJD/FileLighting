@@ -87,6 +87,11 @@ void copy_to_clipboard(const std::string& text) {
 }
 
 int main() {
+    if (!crypto::init()) {
+        std::cerr << "Failed to initialize crypto library." << std::endl;
+        return 1;
+    }
+
     auto screen = ScreenInteractive::Fullscreen();
     int active_screen = SCREEN_CONNECTION;
     int settings_previous_screen = SCREEN_CONNECTION;
@@ -344,8 +349,10 @@ int main() {
                 peerInfo.ip = peer_decoded.substr(0, first_colon);
                 try {
                     peerInfo.port = static_cast<uint16_t>(std::stoul(peer_decoded.substr(first_colon + 1, second_colon - first_colon - 1)));
+                    // Validate that the IP address parses correctly so it doesn't crash later
+                    asio::ip::make_address(peerInfo.ip);
                 } catch (...) {
-                    return; // Invalid port
+                    return; // Invalid port or IP format
                 }
                 
                 std::string key_str = peer_decoded.substr(second_colon + 1);
