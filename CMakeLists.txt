@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.2)
+cmake_minimum_required(VERSION 3.28)
 project(SendLighting)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -13,9 +13,9 @@ FetchContent_MakeAvailable(ftxui)
 
 # --- ASIO ---
 FetchContent_Declare(
-    asio
-    URL https://github.com/chriskohlhoff/asio/archive/refs/heads/master.tar.gz
-    SOURCE_SUBDIR  none
+        asio
+        URL https://github.com/chriskohlhoff/asio/archive/refs/heads/master.tar.gz
+        SOURCE_SUBDIR  none
 )
 FetchContent_MakeAvailable(asio)
 
@@ -29,17 +29,17 @@ target_link_libraries(asio_lib INTERFACE Threads::Threads)
 
 # --- LIBSODIUM ---
 FetchContent_Declare(
-  libsodium
-  GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
-  GIT_TAG        master
+        libsodium
+        GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
+        GIT_TAG        master
 )
 FetchContent_MakeAvailable(libsodium)
 
 # --- CLIP (Cross-Platform Clipboard) ---
 FetchContent_Declare(
-  clip
-  GIT_REPOSITORY https://github.com/dacap/clip.git
-  GIT_TAG        main
+        clip
+        GIT_REPOSITORY https://github.com/dacap/clip.git
+        GIT_TAG        main
 )
 FetchContent_MakeAvailable(clip)
 
@@ -56,5 +56,15 @@ target_link_libraries(FileLighting
 )
 
 if(WIN32)
+    # 1. Link Windows networking libraries (Required for ASIO)
     target_link_libraries(FileLighting PRIVATE ws2_32 wsock32)
+
+    # 2. Statically link C/C++ runtimes if using GCC/Clang
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_link_options(FileLighting PRIVATE
+                "-static"
+                "-static-libgcc"
+                "-static-libstdc++"
+        )
+    endif()
 endif()

@@ -509,36 +509,38 @@ int main() {
                 }
 
                 // --- 2. SEND PACKETS (Stop-and-Wait ARQ) ---
-                auto now = std::chrono::steady_clock::now();
-                std::lock_guard<std::mutex> lock(queue_mutex);
-                
-                // Prioritize sending ACKs immediately
-                for (auto it = outbound_queue.begin(); it != outbound_queue.end(); ) {
-                    if (it->is_ack) {
-                        asio::error_code send_ec;
-                        udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
-                        p2p_socket.send_to(asio::buffer(it->payload), peer_endp, 0, send_ec);
-                        it = outbound_queue.erase(it); // Remove immediately, ACKs don't get retried
-                    } else {
-                        ++it;
-                    }
-                }
-                
-                // Process the reliable queue (Stop-and-Wait: only look at the very front of the queue)
-                if (!outbound_queue.empty()) {
-                    auto& msg = outbound_queue.front();
-                    auto timeout = std::chrono::milliseconds(static_cast<int>(srtt_ms + 4 * rttvar_ms));
+                {
+                    auto now = std::chrono::steady_clock::now();
+                    std::lock_guard<std::mutex> lock(queue_mutex);
                     
-                    if (!msg.in_flight || (now - msg.send_time) > timeout) {
-                        asio::error_code send_ec;
-                        udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
-                        p2p_socket.send_to(asio::buffer(msg.payload), peer_endp, 0, send_ec);
-                        
-                        msg.send_time = now;
-                        msg.in_flight = true;
-                        msg.retries++;
+                    // Prioritize sending ACKs immediately
+                    for (auto it = outbound_queue.begin(); it != outbound_queue.end(); ) {
+                        if (it->is_ack) {
+                            asio::error_code send_ec;
+                            udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
+                            p2p_socket.send_to(asio::buffer(it->payload), peer_endp, 0, send_ec);
+                            it = outbound_queue.erase(it); // Remove immediately, ACKs don't get retried
+                        } else {
+                            ++it;
+                        }
                     }
-                }
+                    
+                    // Process the reliable queue (Stop-and-Wait: only look at the very front of the queue)
+                    if (!outbound_queue.empty()) {
+                        auto& msg = outbound_queue.front();
+                        auto timeout = std::chrono::milliseconds(static_cast<int>(srtt_ms + 4 * rttvar_ms));
+                        
+                        if (!msg.in_flight || (now - msg.send_time) > timeout) {
+                            asio::error_code send_ec;
+                            udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
+                            p2p_socket.send_to(asio::buffer(msg.payload), peer_endp, 0, send_ec);
+                            
+                            msg.send_time = now;
+                            msg.in_flight = true;
+                            msg.retries++;
+                        }
+                    }
+                } // MUTEX IS RELEASED HERE!
                 
                 // Sleep briefly to prevent pinning the CPU at 100%
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
