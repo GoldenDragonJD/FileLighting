@@ -125,8 +125,8 @@ int main() {
         
         plaintext.insert(plaintext.end(), data.begin(), data.end());
         
-        std::vector<unsigned char> key(peerInfo.security_key.begin(), peerInfo.security_key.end());
-        std::vector<unsigned char> encrypted_payload = crypto::encrypt_data(plaintext, key);
+        // Encrypt the outgoing message with OUR key (the one generated at startup)
+        std::vector<unsigned char> encrypted_payload = crypto::encrypt_data(plaintext, encryption_key);
         
         BufferedMessage msg;
         msg.sequence_number = seq;

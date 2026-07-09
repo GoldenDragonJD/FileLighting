@@ -11,17 +11,14 @@ namespace crypto {
     // Returns true on success, false on failure.
     bool init();
 
-    // Check if hardware AES-256-GCM is available on this CPU
-    bool is_aes256gcm_available();
-
-    // Generates a random 256-bit key suitable for AES-256-GCM
+    // Generates a random 256-bit key suitable for XChaCha20-Poly1305
     std::vector<unsigned char> generate_key();
 
-    // Encrypts plaintext using AES-256-GCM (Hardware accelerated)
-    // Returns a vector containing [nonce (12 bytes) || ciphertext || mac (16 bytes)]
+    // Encrypts plaintext using XChaCha20-Poly1305
+    // Returns a vector containing [nonce (24 bytes) || ciphertext || mac (16 bytes)]
     std::vector<unsigned char> encrypt_data(const std::vector<unsigned char>& plaintext, const std::vector<unsigned char>& key);
 
-    // Decrypts ciphertext (which must include the prepended 12-byte nonce) using AES-256-GCM
+    // Decrypts ciphertext (which must include the prepended 24-byte nonce) using XChaCha20-Poly1305
     // Returns the plaintext on success, throws std::runtime_error on failure
     std::vector<unsigned char> decrypt_data(const std::vector<unsigned char>& ciphertext_with_nonce, const std::vector<unsigned char>& key);
 
