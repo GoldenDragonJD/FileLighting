@@ -356,11 +356,18 @@ int main() {
 
             is_connecting = true;
             connect_btn_label = "Cancel";
+            
+            // Immediately queue a PING to start the hole punching process
+            enqueue_message(MessageType::PING, "PING");
         }
         else if (is_connecting)
         {
             is_connecting = false;
             connect_btn_label = "Connect";
+            
+            // Clear out any old messages if we cancel
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            outbound_queue.clear();
         }
     };
 
@@ -448,6 +455,12 @@ int main() {
                                 std::lock_guard<std::mutex> lock(queue_mutex);
                                 if (!outbound_queue.empty() && outbound_queue.front().sequence_number == acked_seq) {
                                     outbound_queue.erase(outbound_queue.begin()); // Successfully delivered!
+                                    
+                                    // If our PING got ACKed and we are still connecting, hole punch is successful!
+                                    if (active_screen == SCREEN_CONNECTION) {
+                                        active_screen = SCREEN_MAIN;
+                                        screen.PostEvent(Event::Custom);
+                                    }
                                 }
                             } else {
                                 // Reconstruct the ACK payload (the sequence number we just received)
@@ -456,6 +469,12 @@ int main() {
                                 ack_payload.push_back(decrypted_data[2]);
                                 ack_payload.push_back(decrypted_data[3]);
                                 ack_payload.push_back(decrypted_data[4]);
+                                
+                                // If they sent us a PING and we are still connecting, hole punch is successful!
+                                if (active_screen == SCREEN_CONNECTION && type == MessageType::PING) {
+                                    active_screen = SCREEN_MAIN;
+                                    screen.PostEvent(Event::Custom);
+                                }
                                 
                                 if (seq <= last_processed_seq) {
                                     // It's a duplicate! We already processed it. Just send the ACK back.
