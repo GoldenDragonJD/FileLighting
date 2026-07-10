@@ -21,26 +21,20 @@ std::vector<unsigned char> encrypt_data(const std::vector<unsigned char>& plaint
         throw std::invalid_argument("Invalid key size");
     }
 
-    std::vector<unsigned char> nonce(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-    randombytes_buf(nonce.data(), nonce.size());
-
-    std::vector<unsigned char> ciphertext(plaintext.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    std::vector<unsigned char> result(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + plaintext.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+    randombytes_buf(result.data(), crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+    
     unsigned long long ciphertext_len;
-
     crypto_aead_xchacha20poly1305_ietf_encrypt(
-        ciphertext.data(), &ciphertext_len,
+        result.data() + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, &ciphertext_len,
         plaintext.data(), plaintext.size(),
         nullptr, 0, // Additional data
         nullptr, // Secret nonce
-        nonce.data(),
+        result.data(), // Nonce
         key.data()
     );
-
-    std::vector<unsigned char> result;
-    result.reserve(nonce.size() + ciphertext_len);
-    result.insert(result.end(), nonce.begin(), nonce.end());
-    result.insert(result.end(), ciphertext.begin(), ciphertext.begin() + ciphertext_len);
-
+    
+    result.resize(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + ciphertext_len);
     return result;
 }
 
