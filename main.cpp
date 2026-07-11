@@ -33,7 +33,7 @@ struct FileTransfer {
     std::string file_path;
     size_t total_size{};
     size_t current_size{};
-    
+
     std::string speed_text = "0.0 MB/s";
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point last_speed_update;
@@ -47,11 +47,15 @@ struct ActiveIncomingBlock {
     uint32_t current_block = 0;
     std::chrono::steady_clock::time_point last_receive_time;
     std::chrono::steady_clock::time_point last_nack_time;
+    size_t file_size = 0;
+    size_t file_bytes_received = 0;
 };
 
 struct ActiveOutgoingBlock {
     std::shared_ptr<std::ifstream> stream;
     uint32_t current_block = 0;
+    size_t file_size = 0;
+    size_t file_bytes_sent = 0;
 };
 
 struct PeerInformation
@@ -105,7 +109,7 @@ void copy_to_clipboard(const std::string& text) {
     if (!base64_text.empty() && base64_text.back() == '\0') {
         base64_text.pop_back();
     }
-    
+
     std::cout << "\033]52;c;" << base64_text << "\a" << std::flush;
 
     // 2. Fallback to local clipboard via clip.h for native environments
@@ -127,7 +131,7 @@ int main() {
 
     asio::io_context io_ctx;
     std::vector<unsigned char> encryption_key = crypto::generate_key();
-    
+
     // Create the UDP socket to be reused for STUN and P2P communication.
     // Binding to port 0 means the OS will choose an ephemeral port for us.
     udp::socket p2p_socket(io_ctx, udp::endpoint(udp::v4(), 0));
@@ -144,31 +148,31 @@ int main() {
 
     auto enqueue_message = [&](MessageType type, const std::string& data) {
         if (peerInfo.security_key.empty()) return;
-        
+
         std::vector<unsigned char> plaintext;
         plaintext.push_back(static_cast<uint8_t>(type));
-        
+
         uint32_t seq;
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
             seq = next_sequence_number++;
         }
-        
+
         plaintext.push_back((seq >> 24) & 0xFF);
         plaintext.push_back((seq >> 16) & 0xFF);
         plaintext.push_back((seq >> 8) & 0xFF);
         plaintext.push_back(seq & 0xFF);
-        
+
         plaintext.insert(plaintext.end(), data.begin(), data.end());
-        
+
         // Encrypt the outgoing message with OUR key (the one generated at startup)
         std::vector<unsigned char> encrypted_payload = crypto::encrypt_data(plaintext, encryption_key);
-        
+
         BufferedMessage msg;
         msg.sequence_number = seq;
         msg.payload = encrypted_payload;
         msg.is_ack = (type == MessageType::ACK);
-        
+
         std::lock_guard<std::mutex> lock(queue_mutex);
         outbound_queue.push_back(msg);
     };
@@ -250,6 +254,7 @@ int main() {
 
     std::vector<std::string> chat_history;
     std::map<uint32_t, FileTransfer> file_transfers;
+    std::map<uint32_t, uint32_t> file_to_transfer;
     std::map<uint32_t, ActiveIncomingBlock> incoming_transfers;
     std::map<uint32_t, ActiveOutgoingBlock> outgoing_transfers;
     std::vector<std::string> all_directory_files;
@@ -263,7 +268,7 @@ int main() {
     auto api_add_chat_message = [&](const std::string& who, const std::string& message) {
         chat_history.push_back(who + ": " + message);
     };
-    
+
     auto send_unreliable = [&](MessageType type, const std::vector<unsigned char>& payload) {
         if (peerInfo.security_key.empty() || peerInfo.ip.empty()) return;
         std::vector<unsigned char> plaintext;
@@ -285,59 +290,107 @@ int main() {
     auto blast_chunk = [&](uint32_t file_id, uint32_t block_index, uint32_t chunk_index, const std::vector<unsigned char>& block_data) {
         size_t offset = chunk_index * CHUNK_SIZE;
         if (offset >= block_data.size()) return;
-        
+
         size_t size = std::min(CHUNK_SIZE, block_data.size() - offset);
-        
+
         std::vector<unsigned char> payload;
         payload.reserve(12 + size);
         payload.push_back((file_id >> 24) & 0xFF); payload.push_back((file_id >> 16) & 0xFF);
         payload.push_back((file_id >> 8) & 0xFF); payload.push_back(file_id & 0xFF);
-        
+
         payload.push_back((block_index >> 24) & 0xFF); payload.push_back((block_index >> 16) & 0xFF);
         payload.push_back((block_index >> 8) & 0xFF); payload.push_back(block_index & 0xFF);
-        
+
         payload.push_back((chunk_index >> 24) & 0xFF); payload.push_back((chunk_index >> 16) & 0xFF);
         payload.push_back((chunk_index >> 8) & 0xFF); payload.push_back(chunk_index & 0xFF);
-        
+
         payload.insert(payload.end(), block_data.begin() + offset, block_data.begin() + offset + size);
         send_unreliable(MessageType::FILE_DATA_CHUNK, payload);
     };
-    
+
     auto blast_block = [&](uint32_t file_id, uint32_t block_index) {
         auto& out_transfer = outgoing_transfers[file_id];
         if (!out_transfer.stream) return;
-        
+
         size_t file_offset = block_index * BLOCK_CHUNKS * CHUNK_SIZE;
         out_transfer.stream->clear();
         out_transfer.stream->seekg(file_offset, std::ios::beg);
-        
+
         std::vector<unsigned char> block_data(BLOCK_CHUNKS * CHUNK_SIZE);
         out_transfer.stream->read(reinterpret_cast<char*>(block_data.data()), block_data.size());
         size_t bytes_read = out_transfer.stream->gcount();
         if (bytes_read == 0) return;
         block_data.resize(bytes_read);
-        
+
         size_t num_chunks = (bytes_read + CHUNK_SIZE - 1) / CHUNK_SIZE;
         for (uint32_t c = 0; c < num_chunks; ++c) {
             blast_chunk(file_id, block_index, c, block_data);
         }
     };
-    
-    auto start_sending_file = [&](const std::string& full_path, const std::string& filename) {
+
+    auto start_sending_item = [&](const std::string& full_path, const std::string& item_name) {
         std::error_code ec;
-        size_t file_size = fs::file_size(full_path, ec);
-        if (ec) return;
-        uint32_t file_id = static_cast<uint32_t>(rand());
-        auto now_t = std::chrono::steady_clock::now();
-        file_transfers[file_id] = {file_id, full_path, file_size, 0, "0.0 MB/s", now_t, now_t, 0};
-        outgoing_transfers[file_id] = {std::make_shared<std::ifstream>(full_path, std::ios::binary), 0};
-        
-        std::string payload;
-        payload.push_back((file_id >> 24) & 0xFF); payload.push_back((file_id >> 16) & 0xFF);
-        payload.push_back((file_id >> 8) & 0xFF); payload.push_back(file_id & 0xFF);
-        for (int i = 0; i < 8; ++i) payload.push_back((file_size >> (56 - i * 8)) & 0xFF);
-        payload += filename;
-        enqueue_message(MessageType::FILE_METADATA, payload);
+        if (fs::is_directory(full_path, ec)) {
+            size_t total_size = 0;
+            std::vector<fs::path> files;
+            for (const auto& entry : fs::recursive_directory_iterator(full_path)) {
+                if (entry.is_regular_file()) {
+                    total_size += entry.file_size(ec);
+                    files.push_back(entry.path());
+                }
+            }
+            if (files.empty()) return;
+
+            uint32_t batch_id = static_cast<uint32_t>(rand());
+            auto now_t = std::chrono::steady_clock::now();
+            file_transfers[batch_id] = {batch_id, item_name, total_size, 0, "0.0 MB/s", now_t, now_t, 0};
+
+            for (const auto& file_path : files) {
+                uint32_t file_id = static_cast<uint32_t>(rand());
+                file_to_transfer[file_id] = batch_id;
+
+                size_t file_size = fs::file_size(file_path, ec);
+                outgoing_transfers[file_id] = {std::make_shared<std::ifstream>(file_path.string(), std::ios::binary), 0, file_size, 0};
+
+                std::string rel_path = fs::relative(file_path, fs::path(full_path).parent_path()).string();
+
+                std::string payload;
+                payload.push_back((file_id >> 24) & 0xFF); payload.push_back((file_id >> 16) & 0xFF);
+                payload.push_back((file_id >> 8) & 0xFF); payload.push_back(file_id & 0xFF);
+
+                payload.push_back((batch_id >> 24) & 0xFF); payload.push_back((batch_id >> 16) & 0xFF);
+                payload.push_back((batch_id >> 8) & 0xFF); payload.push_back(batch_id & 0xFF);
+
+                for (int i = 0; i < 8; ++i) payload.push_back((total_size >> (56 - i * 8)) & 0xFF);
+                for (int i = 0; i < 8; ++i) payload.push_back((file_size >> (56 - i * 8)) & 0xFF);
+
+                payload += rel_path;
+                enqueue_message(MessageType::FILE_METADATA, payload);
+            }
+        } else {
+            size_t file_size = fs::file_size(full_path, ec);
+            if (ec) return;
+            uint32_t file_id = static_cast<uint32_t>(rand());
+            uint32_t batch_id = file_id;
+            auto now_t = std::chrono::steady_clock::now();
+            file_transfers[batch_id] = {batch_id, item_name, file_size, 0, "0.0 MB/s", now_t, now_t, 0};
+            file_to_transfer[file_id] = batch_id;
+
+            outgoing_transfers[file_id] = {std::make_shared<std::ifstream>(full_path, std::ios::binary), 0, file_size, 0};
+
+            std::string payload;
+            payload.push_back((file_id >> 24) & 0xFF); payload.push_back((file_id >> 16) & 0xFF);
+            payload.push_back((file_id >> 8) & 0xFF); payload.push_back(file_id & 0xFF);
+
+            payload.push_back((batch_id >> 24) & 0xFF); payload.push_back((batch_id >> 16) & 0xFF);
+            payload.push_back((batch_id >> 8) & 0xFF); payload.push_back(batch_id & 0xFF);
+
+            for (int i = 0; i < 8; ++i) payload.push_back((file_size >> (56 - i * 8)) & 0xFF);
+            for (int i = 0; i < 8; ++i) payload.push_back((file_size >> (56 - i * 8)) & 0xFF);
+
+            payload += item_name;
+            enqueue_message(MessageType::FILE_METADATA, payload);
+        }
     };
     // -----------------------------------------
 
@@ -435,12 +488,12 @@ int main() {
                 decoded_bin.data(), decoded_bin.size(),
                 peer_code.data(), peer_code.size(),
                 " \n\r\t", &decoded_len, nullptr,
-                sodium_base64_VARIANT_URLSAFE) != 0) 
+                sodium_base64_VARIANT_URLSAFE) != 0)
             {
                 // Failed to decode
                 return;
             }
-            
+
             std::string peer_decoded(reinterpret_cast<char*>(decoded_bin.data()), decoded_len);
 
             size_t first_colon = peer_decoded.find(':');
@@ -455,7 +508,7 @@ int main() {
                 } catch (...) {
                     return; // Invalid port or IP format
                 }
-                
+
                 std::string key_str = peer_decoded.substr(second_colon + 1);
                 peerInfo.security_key.assign(key_str.begin(), key_str.end());
             } else {
@@ -464,7 +517,7 @@ int main() {
 
             is_connecting = true;
             connect_btn_label = "Cancel";
-            
+
             // Immediately queue a PING to start the hole punching process
             enqueue_message(MessageType::PING, "PING");
         }
@@ -472,7 +525,7 @@ int main() {
         {
             is_connecting = false;
             connect_btn_label = "Connect";
-            
+
             // Clear out any old messages if we cancel
             std::lock_guard<std::mutex> lock(queue_mutex);
             outbound_queue.clear();
@@ -498,18 +551,18 @@ int main() {
             {
                 // Make sure socket is blocking for STUN
                 p2p_socket.non_blocking(false);
-                
+
                 // Keep timestamps fresh while in the lobby so it doesn't instantly timeout upon connecting
                 last_receive_time = std::chrono::steady_clock::now();
                 last_ping_send_time = std::chrono::steady_clock::now();
-                
+
                 std::optional<stun::PublicEndpoint> endpoint;
                 if (is_local_mode) {
                     endpoint = stun::fetch_local_endpoint(io_ctx, p2p_socket);
                 } else {
                     endpoint = stun::fetch_public_endpoint(io_ctx, p2p_socket);
                 }
-                
+
                 if (endpoint)
                 {
                     std::string secure_key = std::format("{}:{}:{}",
@@ -533,7 +586,7 @@ int main() {
 
                     api_update_secure_key(base64_key);
                     screen.PostEvent(Event::Custom);
-                    
+
                     bool was_local = is_local_mode;
                     for (int i = 0; i < 250 && !is_connecting; ++i) {
                         if (was_local != is_local_mode) {
@@ -548,7 +601,7 @@ int main() {
                 {
                     api_update_secure_key(is_local_mode ? "Unable to get local IP." : "Unable to reach STUN server.");
                     screen.PostEvent(Event::Custom);
-                    
+
                     bool was_local = is_local_mode;
                     for (int i = 0; i < 50 && !is_connecting; ++i) {
                         if (was_local != is_local_mode) {
@@ -563,8 +616,8 @@ int main() {
             else
             {
                 // Switch to non-blocking for P2P loop
-                p2p_socket.non_blocking(true); 
-                
+                p2p_socket.non_blocking(true);
+
                 auto now = std::chrono::steady_clock::now();
                 int packets_processed_this_tick = 0;
 
@@ -575,89 +628,96 @@ int main() {
                 while (packets_processed_this_tick < 5000) {
                     asio::error_code ec;
                     size_t len = p2p_socket.receive_from(asio::buffer(recv_buffer), sender_endpoint, 0, ec);
-                    
+
                     if (ec || len == 0) break;
-                    
+
                     packets_processed_this_tick++;
                     // We received a packet, the connection is alive!
                     last_receive_time = now;
-                    
+
                     try {
                         std::vector<unsigned char> encrypted_data(recv_buffer.begin(), recv_buffer.begin() + len);
                         std::vector<unsigned char> decrypted_data = crypto::decrypt_data(encrypted_data, loop_key);
-                        
+
                         if (decrypted_data.size() >= 5) {
                             auto type = static_cast<MessageType>(decrypted_data[0]);
-                            
+
                             if (type == MessageType::FILE_DATA_CHUNK) {
                                 if (decrypted_data.size() >= 1 + 12) {
                                     uint32_t file_id = (decrypted_data[1] << 24) | (decrypted_data[2] << 16) | (decrypted_data[3] << 8) | decrypted_data[4];
                                     uint32_t block_idx = (decrypted_data[5] << 24) | (decrypted_data[6] << 16) | (decrypted_data[7] << 8) | decrypted_data[8];
                                     uint32_t chunk_idx = (decrypted_data[9] << 24) | (decrypted_data[10] << 16) | (decrypted_data[11] << 8) | decrypted_data[12];
-                                    
-                                    if (incoming_transfers.count(file_id) && file_transfers.count(file_id)) {
-                                        auto& in_block = incoming_transfers[file_id];
-                                        auto& ft = file_transfers[file_id];
-                                        if (block_idx == in_block.current_block && chunk_idx < in_block.chunk_received.size() && !in_block.chunk_received[chunk_idx]) {
-                                            size_t chunk_len = decrypted_data.size() - 13;
-                                            size_t offset = chunk_idx * CHUNK_SIZE;
-                                            if (offset + chunk_len <= in_block.full_block_data.size()) {
-                                                std::copy(decrypted_data.begin() + 13, decrypted_data.end(), in_block.full_block_data.begin() + offset);
-                                            }
-                                            in_block.chunk_received[chunk_idx] = true;
-                                            
-                                            ft.current_size += chunk_len;
-                                            ft.bytes_since_last_update += chunk_len;
-                                            in_block.last_receive_time = now;
-                                            
-                                            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - ft.last_speed_update).count();
-                                            if (duration > 1000) {
-                                                double speed = (double)ft.bytes_since_last_update / (1024.0 * 1024.0) / (duration / 1000.0);
-                                                ft.speed_text = std::format("{:.2f} MB/s", speed);
-                                                ft.last_speed_update = now;
-                                                ft.bytes_since_last_update = 0;
-                                                screen.PostEvent(Event::Custom);
-                                            }
-                                            
-                                            bool all_received = true;
-                                            for (bool r : in_block.chunk_received) {
-                                                if (!r) { all_received = false; break; }
-                                            }
-                                            
-                                            if (all_received) {
-                                                size_t write_size = std::min(in_block.full_block_data.size(), ft.total_size - (in_block.current_block * BLOCK_CHUNKS * CHUNK_SIZE));
-                                                in_block.stream->write(reinterpret_cast<const char*>(in_block.full_block_data.data()), write_size);
-                                                
-                                                if (ft.current_size >= ft.total_size) {
-                                                    in_block.stream->close();
-                                                    api_add_chat_message("System", "Transfer finished: " + fs::path(ft.file_path).filename().string() + " in " + settings_download_dir);
-                                                    incoming_transfers.erase(file_id);
-                                                    file_transfers.erase(file_id);
-                                                } else {
-                                                    in_block.current_block++;
-                                                    size_t remaining_bytes = ft.total_size - ft.current_size;
-                                                    size_t next_block_chunks = std::min(BLOCK_CHUNKS, (remaining_bytes + CHUNK_SIZE - 1) / CHUNK_SIZE);
-                                                    in_block.chunk_received.assign(next_block_chunks, false);
-                                                    in_block.full_block_data.assign(next_block_chunks * CHUNK_SIZE, 0);
+
+                                    if (incoming_transfers.count(file_id) && file_to_transfer.count(file_id)) {
+                                        uint32_t batch_id = file_to_transfer[file_id];
+                                        if (file_transfers.count(batch_id)) {
+                                            auto& in_block = incoming_transfers[file_id];
+                                            auto& ft = file_transfers[batch_id];
+                                            if (block_idx == in_block.current_block && chunk_idx < in_block.chunk_received.size() && !in_block.chunk_received[chunk_idx]) {
+                                                size_t chunk_len = decrypted_data.size() - 13;
+                                                size_t offset = chunk_idx * CHUNK_SIZE;
+                                                if (offset + chunk_len <= in_block.full_block_data.size()) {
+                                                    std::copy(decrypted_data.begin() + 13, decrypted_data.end(), in_block.full_block_data.begin() + offset);
                                                 }
-                                                
-                                                std::string ack_payload;
-                                                ack_payload.push_back((file_id >> 24) & 0xFF); ack_payload.push_back((file_id >> 16) & 0xFF);
-                                                ack_payload.push_back((file_id >> 8) & 0xFF); ack_payload.push_back(file_id & 0xFF);
-                                                ack_payload.push_back((block_idx >> 24) & 0xFF); ack_payload.push_back((block_idx >> 16) & 0xFF);
-                                                ack_payload.push_back((block_idx >> 8) & 0xFF); ack_payload.push_back(block_idx & 0xFF);
-                                                enqueue_message(MessageType::FILE_BLOCK_ACK, ack_payload);
-                                                screen.PostEvent(Event::Custom);
+                                                in_block.chunk_received[chunk_idx] = true;
+
+                                                ft.current_size += chunk_len;
+                                                in_block.file_bytes_received += chunk_len;
+                                                ft.bytes_since_last_update += chunk_len;
+                                                in_block.last_receive_time = now;
+
+                                                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - ft.last_speed_update).count();
+                                                if (duration > 1000) {
+                                                    double speed = (double)ft.bytes_since_last_update / (1024.0 * 1024.0) / (duration / 1000.0);
+                                                    ft.speed_text = std::format("{:.2f} MB/s", speed);
+                                                    ft.last_speed_update = now;
+                                                    ft.bytes_since_last_update = 0;
+                                                    screen.PostEvent(Event::Custom);
+                                                }
+
+                                                bool all_received = true;
+                                                for (bool r : in_block.chunk_received) {
+                                                    if (!r) { all_received = false; break; }
+                                                }
+
+                                                if (all_received) {
+                                                    size_t write_size = std::min(in_block.full_block_data.size(), in_block.file_size - (in_block.current_block * BLOCK_CHUNKS * CHUNK_SIZE));
+                                                    in_block.stream->write(reinterpret_cast<const char*>(in_block.full_block_data.data()), write_size);
+
+                                                    if (in_block.file_bytes_received >= in_block.file_size) {
+                                                        in_block.stream->close();
+                                                        incoming_transfers.erase(file_id);
+                                                        file_to_transfer.erase(file_id);
+                                                        if (ft.current_size >= ft.total_size) {
+                                                            api_add_chat_message("System", "Transfer finished: " + ft.file_path + " in " + settings_download_dir);
+                                                            file_transfers.erase(batch_id);
+                                                        }
+                                                    } else {
+                                                        in_block.current_block++;
+                                                        size_t remaining_bytes = in_block.file_size - (in_block.current_block * BLOCK_CHUNKS * CHUNK_SIZE);
+                                                        size_t next_block_chunks = std::min(BLOCK_CHUNKS, (remaining_bytes + CHUNK_SIZE - 1) / CHUNK_SIZE);
+                                                        in_block.chunk_received.assign(next_block_chunks, false);
+                                                        in_block.full_block_data.assign(next_block_chunks * CHUNK_SIZE, 0);
+                                                    }
+
+                                                    std::string ack_payload;
+                                                    ack_payload.push_back((file_id >> 24) & 0xFF); ack_payload.push_back((file_id >> 16) & 0xFF);
+                                                    ack_payload.push_back((file_id >> 8) & 0xFF); ack_payload.push_back(file_id & 0xFF);
+                                                    ack_payload.push_back((block_idx >> 24) & 0xFF); ack_payload.push_back((block_idx >> 16) & 0xFF);
+                                                    ack_payload.push_back((block_idx >> 8) & 0xFF); ack_payload.push_back(block_idx & 0xFF);
+                                                    enqueue_message(MessageType::FILE_BLOCK_ACK, ack_payload);
+                                                    screen.PostEvent(Event::Custom);
+                                                }
                                             }
                                         }
                                     }
                                 }
                                 continue;
                             }
-                            
+
                             uint32_t seq = (decrypted_data[1] << 24) | (decrypted_data[2] << 16) | (decrypted_data[3] << 8) | decrypted_data[4];
                             std::string payload(decrypted_data.begin() + 5, decrypted_data.end());
-                            
+
                             if (type == MessageType::ACK) {
                                 uint32_t acked_seq = 0;
                                 if (payload.size() == 4) {
@@ -666,11 +726,11 @@ int main() {
                                                 (static_cast<uint8_t>(payload[2]) << 8) |
                                                 static_cast<uint8_t>(payload[3]);
                                 }
-                                
+
                                 std::lock_guard<std::mutex> lock(queue_mutex);
                                 if (!outbound_queue.empty() && outbound_queue.front().sequence_number == acked_seq) {
                                     outbound_queue.erase(outbound_queue.begin()); // Successfully delivered!
-                                    
+
                                     // If our PING got ACKed and we are still connecting, hole punch is successful!
                                     if (active_screen == SCREEN_CONNECTION) {
                                         active_screen = SCREEN_MAIN;
@@ -684,44 +744,80 @@ int main() {
                                 ack_payload.push_back(decrypted_data[2]);
                                 ack_payload.push_back(decrypted_data[3]);
                                 ack_payload.push_back(decrypted_data[4]);
-                                
+
                                 // If they sent us a PING and we are still connecting, hole punch is successful!
                                 if (active_screen == SCREEN_CONNECTION && type == MessageType::PING) {
                                     active_screen = SCREEN_MAIN;
                                     screen.PostEvent(Event::Custom);
                                 }
-                                
+
                                 if (seq <= last_processed_seq) {
                                     // It's a duplicate! We already processed it. Just send the ACK back.
                                     enqueue_message(MessageType::ACK, ack_payload);
                                 } else {
                                     // It's a brand new message!
                                     last_processed_seq = seq;
-                                    
+
                                     // --- PROCESS THE MESSAGE DATA ---
                                     if (type == MessageType::TEXT_MESSAGE) {
                                         api_add_chat_message("Peer", payload);
                                         screen.PostEvent(Event::Custom);
                                     } else if (type == MessageType::FILE_METADATA) {
-                                        if (payload.size() >= 12) {
+                                        if (payload.size() >= 24) {
                                             uint32_t file_id = (static_cast<uint8_t>(payload[0]) << 24) | (static_cast<uint8_t>(payload[1]) << 16) | (static_cast<uint8_t>(payload[2]) << 8) | static_cast<uint8_t>(payload[3]);
+                                            uint32_t batch_id = (static_cast<uint8_t>(payload[4]) << 24) | (static_cast<uint8_t>(payload[5]) << 16) | (static_cast<uint8_t>(payload[6]) << 8) | static_cast<uint8_t>(payload[7]);
+                                            
+                                            uint64_t batch_total_size = 0;
+                                            for(int i = 0; i < 8; ++i) batch_total_size |= (static_cast<uint64_t>(static_cast<uint8_t>(payload[8 + i])) << (56 - i * 8));
+                                            
                                             uint64_t file_size = 0;
-                                            for(int i = 0; i < 8; ++i) file_size |= (static_cast<uint64_t>(static_cast<uint8_t>(payload[4 + i])) << (56 - i * 8));
-                                            std::string filename = payload.substr(12);
+                                            for(int i = 0; i < 8; ++i) file_size |= (static_cast<uint64_t>(static_cast<uint8_t>(payload[16 + i])) << (56 - i * 8));
                                             
+                                            std::string filename = payload.substr(24);
+
                                             std::string save_path = (fs::path(settings_download_dir) / filename).string();
+                                            std::error_code ec;
+                                            fs::create_directories(fs::path(save_path).parent_path(), ec);
+
                                             auto now_t = std::chrono::steady_clock::now();
-                                            file_transfers[file_id] = {file_id, save_path, file_size, 0, "0.0 MB/s", now_t, now_t, 0};
+                                            file_to_transfer[file_id] = batch_id;
                                             
+                                            if (file_transfers.find(batch_id) == file_transfers.end()) {
+                                                std::string display_name = filename;
+                                                size_t first_slash = filename.find('/');
+                                                if (first_slash != std::string::npos && first_slash != 0) {
+                                                    display_name = filename.substr(0, first_slash);
+                                                } else {
+                                                    size_t first_bslash = filename.find('\\');
+                                                    if (first_bslash != std::string::npos && first_bslash != 0) {
+                                                        display_name = filename.substr(0, first_bslash);
+                                                    }
+                                                }
+                                                file_transfers[batch_id] = {batch_id, display_name, batch_total_size, 0, "0.0 MB/s", now_t, now_t, 0};
+                                            }
+
                                             auto stream = std::make_shared<std::ofstream>(save_path, std::ios::binary);
-                                            size_t next_block_chunks = std::min(BLOCK_CHUNKS, (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE);
-                                            incoming_transfers[file_id] = {
-                                                stream,
-                                                std::vector<bool>(next_block_chunks, false),
-                                                std::vector<unsigned char>(next_block_chunks * CHUNK_SIZE, 0),
-                                                0, now_t, now_t
-                                            };
-                                            
+                                            if (file_size == 0) {
+                                                stream->close();
+                                                if (file_transfers.count(batch_id)) {
+                                                    auto& ft = file_transfers[batch_id];
+                                                    file_to_transfer.erase(file_id);
+                                                    if (ft.current_size >= ft.total_size) {
+                                                        api_add_chat_message("System", "Transfer finished: " + ft.file_path + " in " + settings_download_dir);
+                                                        file_transfers.erase(batch_id);
+                                                    }
+                                                }
+                                            } else {
+                                                size_t next_block_chunks = std::min(BLOCK_CHUNKS, (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE);
+                                                incoming_transfers[file_id] = {
+                                                    stream,
+                                                    std::vector<bool>(next_block_chunks, false),
+                                                    std::vector<unsigned char>(next_block_chunks * CHUNK_SIZE, 0),
+                                                    0, now_t, now_t,
+                                                    file_size, 0
+                                                };
+                                            }
+
                                             std::string ack_payload;
                                             ack_payload.push_back((file_id >> 24) & 0xFF); ack_payload.push_back((file_id >> 16) & 0xFF);
                                             ack_payload.push_back((file_id >> 8) & 0xFF); ack_payload.push_back(file_id & 0xFF);
@@ -731,40 +827,69 @@ int main() {
                                     } else if (type == MessageType::FILE_METADATA_ACK) {
                                         if (payload.size() == 4) {
                                             uint32_t file_id = (static_cast<uint8_t>(payload[0]) << 24) | (static_cast<uint8_t>(payload[1]) << 16) | (static_cast<uint8_t>(payload[2]) << 8) | static_cast<uint8_t>(payload[3]);
-                                            blast_block(file_id, 0);
+                                            if (outgoing_transfers.count(file_id)) {
+                                                if (outgoing_transfers[file_id].file_size == 0) {
+                                                    auto& out_block = outgoing_transfers[file_id];
+                                                    if (out_block.stream) out_block.stream->close();
+                                                    
+                                                    uint32_t batch_id = file_to_transfer[file_id];
+                                                    if (file_transfers.count(batch_id)) {
+                                                        auto& ft = file_transfers[batch_id];
+                                                        outgoing_transfers.erase(file_id);
+                                                        file_to_transfer.erase(file_id);
+                                                        if (ft.current_size >= ft.total_size) {
+                                                            api_add_chat_message("System", "Transfer finished: " + ft.file_path + " sent.");
+                                                            file_transfers.erase(batch_id);
+                                                        }
+                                                        screen.PostEvent(Event::Custom);
+                                                    }
+                                                } else {
+                                                    blast_block(file_id, 0);
+                                                }
+                                            }
                                         }
                                     } else if (type == MessageType::FILE_BLOCK_ACK) {
                                         if (payload.size() == 8) {
                                             uint32_t file_id = (static_cast<uint8_t>(payload[0]) << 24) | (static_cast<uint8_t>(payload[1]) << 16) | (static_cast<uint8_t>(payload[2]) << 8) | static_cast<uint8_t>(payload[3]);
                                             uint32_t block_idx = (static_cast<uint8_t>(payload[4]) << 24) | (static_cast<uint8_t>(payload[5]) << 16) | (static_cast<uint8_t>(payload[6]) << 8) | static_cast<uint8_t>(payload[7]);
-                                            
-                                            if (outgoing_transfers.count(file_id)) {
+
+                                            if (outgoing_transfers.count(file_id) && file_to_transfer.count(file_id)) {
                                                 auto& out_block = outgoing_transfers[file_id];
                                                 out_block.current_block = block_idx + 1;
-                                                auto& ft = file_transfers[file_id];
                                                 
-                                                size_t bytes_sent = out_block.current_block * BLOCK_CHUNKS * CHUNK_SIZE;
-                                                size_t newly_acked = bytes_sent > ft.current_size ? bytes_sent - ft.current_size : 0;
-                                                ft.bytes_since_last_update += newly_acked;
-                                                
-                                                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - ft.last_speed_update).count();
-                                                if (duration > 1000) {
-                                                    double speed = (double)ft.bytes_since_last_update / (1024.0 * 1024.0) / (duration / 1000.0);
-                                                    ft.speed_text = std::format("{:.2f} MB/s", speed);
-                                                    ft.last_speed_update = now;
-                                                    ft.bytes_since_last_update = 0;
-                                                }
+                                                uint32_t batch_id = file_to_transfer[file_id];
+                                                if (file_transfers.count(batch_id)) {
+                                                    auto& ft = file_transfers[batch_id];
 
-                                                if (bytes_sent >= ft.total_size) {
-                                                    out_block.stream->close();
-                                                    api_add_chat_message("System", "Transfer finished: " + fs::path(ft.file_path).filename().string() + " sent.");
-                                                    outgoing_transfers.erase(file_id);
-                                                    file_transfers.erase(file_id);
-                                                    screen.PostEvent(Event::Custom);
-                                                } else {
-                                                    ft.current_size = bytes_sent;
-                                                    blast_block(file_id, out_block.current_block);
-                                                    screen.PostEvent(Event::Custom);
+                                                    size_t bytes_sent = out_block.current_block * BLOCK_CHUNKS * CHUNK_SIZE;
+                                                    size_t actual_bytes_sent = std::min(bytes_sent, out_block.file_size);
+                                                    size_t newly_acked = actual_bytes_sent > out_block.file_bytes_sent ? actual_bytes_sent - out_block.file_bytes_sent : 0;
+                                                    
+                                                    out_block.file_bytes_sent = actual_bytes_sent;
+                                                    ft.current_size += newly_acked;
+                                                    ft.bytes_since_last_update += newly_acked;
+
+                                                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - ft.last_speed_update).count();
+                                                    if (duration > 1000) {
+                                                        double speed = (double)ft.bytes_since_last_update / (1024.0 * 1024.0) / (duration / 1000.0);
+                                                        ft.speed_text = std::format("{:.2f} MB/s", speed);
+                                                        ft.last_speed_update = now;
+                                                        ft.bytes_since_last_update = 0;
+                                                    }
+
+                                                    if (actual_bytes_sent >= out_block.file_size) {
+                                                        out_block.stream->close();
+                                                        outgoing_transfers.erase(file_id);
+                                                        file_to_transfer.erase(file_id);
+                                                        if (ft.current_size >= ft.total_size) {
+                                                            api_add_chat_message("System", "Transfer finished: " + ft.file_path + " sent.");
+                                                            file_transfers.erase(batch_id);
+                                                        }
+                                                        screen.PostEvent(Event::Custom);
+                                                    } else {
+                                                        blast_block(file_id, out_block.current_block);
+                                                        screen.PostEvent(Event::Custom);
+                                                    }
                                                 }
                                             }
                                         }
@@ -772,7 +897,7 @@ int main() {
                                         if (payload.size() >= 8) {
                                             uint32_t file_id = (static_cast<uint8_t>(payload[0]) << 24) | (static_cast<uint8_t>(payload[1]) << 16) | (static_cast<uint8_t>(payload[2]) << 8) | static_cast<uint8_t>(payload[3]);
                                             uint32_t block_idx = (static_cast<uint8_t>(payload[4]) << 24) | (static_cast<uint8_t>(payload[5]) << 16) | (static_cast<uint8_t>(payload[6]) << 8) | static_cast<uint8_t>(payload[7]);
-                                            
+
                                             if (outgoing_transfers.count(file_id) && outgoing_transfers[file_id].current_block == block_idx) {
                                                 auto& out_transfer = outgoing_transfers[file_id];
                                                 if (out_transfer.stream) {
@@ -803,7 +928,8 @@ int main() {
                                         file_transfers.clear();
                                         incoming_transfers.clear();
                                         outgoing_transfers.clear();
-                                        
+                                        file_to_transfer.clear();
+
                                         {
                                             std::lock_guard<std::mutex> lock(queue_mutex);
                                             outbound_queue.clear();
@@ -812,7 +938,7 @@ int main() {
                                         last_processed_seq = 0;
                                         screen.PostEvent(Event::Custom);
                                     }
-                                    
+
                                     // Finally, send the ACK!
                                     enqueue_message(MessageType::ACK, ack_payload);
                                 }
@@ -822,22 +948,22 @@ int main() {
                         // Decryption failed or garbage packet, ignore
                     }
                 }
-                
+
                 // --- 1.5 DISCONNECT DETECTION & KEEPALIVES ---
-                
+
                 if (active_screen == SCREEN_MAIN) {
                     for (auto& [file_id, in_block] : incoming_transfers) {
                         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - in_block.last_receive_time).count() > 500 &&
                             std::chrono::duration_cast<std::chrono::milliseconds>(now - in_block.last_nack_time).count() > 500) {
-                            
+
                             std::string nack_payload;
                             nack_payload.push_back((file_id >> 24) & 0xFF); nack_payload.push_back((file_id >> 16) & 0xFF);
                             nack_payload.push_back((file_id >> 8) & 0xFF); nack_payload.push_back(file_id & 0xFF);
-                            
+
                             uint32_t block_idx = in_block.current_block;
                             nack_payload.push_back((block_idx >> 24) & 0xFF); nack_payload.push_back((block_idx >> 16) & 0xFF);
                             nack_payload.push_back((block_idx >> 8) & 0xFF); nack_payload.push_back(block_idx & 0xFF);
-                            
+
                             bool missing_any = false;
                             for (size_t i = 0; i < in_block.chunk_received.size(); ++i) {
                                 if (!in_block.chunk_received[i]) {
@@ -854,7 +980,7 @@ int main() {
                         }
                     }
                 }
-                
+
                 // If we are fully connected but haven't received ANY packet for 15 seconds, assume disconnect
                 if (active_screen == SCREEN_MAIN && (now - last_receive_time) > std::chrono::seconds(15)) {
                     is_connecting = false;
@@ -864,18 +990,21 @@ int main() {
                     my_code = "Generating secure key...";
                     chat_history.clear();
                     file_transfers.clear();
-                    
+                    incoming_transfers.clear();
+                    outgoing_transfers.clear();
+                    file_to_transfer.clear();
+
                     {
                         std::lock_guard<std::mutex> lock(queue_mutex);
                         outbound_queue.clear();
                         next_sequence_number = 1;
                     }
                     last_processed_seq = 0;
-                    
+
                     screen.PostEvent(Event::Custom);
                     continue; // Skip the rest of the loop and restart as disconnected
                 }
-                
+
                 // If the connection is idle (queue is empty) for 5 seconds, send a keepalive PING
                 if (active_screen == SCREEN_MAIN && (now - last_ping_send_time) > std::chrono::seconds(5)) {
                     bool queue_is_empty;
@@ -893,7 +1022,7 @@ int main() {
                 {
                     auto now = std::chrono::steady_clock::now();
                     std::lock_guard<std::mutex> lock(queue_mutex);
-                    
+
                     // Prioritize sending ACKs immediately
                     for (auto it = outbound_queue.begin(); it != outbound_queue.end(); ) {
                         if (it->is_ack) {
@@ -905,24 +1034,24 @@ int main() {
                             ++it;
                         }
                     }
-                    
+
                     // Process the reliable queue (Stop-and-Wait: only look at the very front of the queue)
                     if (!outbound_queue.empty()) {
                         auto& msg = outbound_queue.front();
                         auto timeout = std::chrono::milliseconds(static_cast<int>(srtt_ms + 4 * rttvar_ms));
-                        
+
                         if (!msg.in_flight || (now - msg.send_time) > timeout) {
                             asio::error_code send_ec;
                             udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
                             p2p_socket.send_to(asio::buffer(msg.payload), peer_endp, 0, send_ec);
-                            
+
                             msg.send_time = now;
                             msg.in_flight = true;
                             msg.retries++;
                         }
                     }
                 } // MUTEX IS RELEASED HERE!
-                
+
                 // Sleep briefly if no packets were processed, to prevent pinning CPU at 100%
                 if (packets_processed_this_tick == 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -935,7 +1064,7 @@ int main() {
 
     Component input_peer_code = Input(&peer_code, "Paste Peer Code Here", peer_input_option) | border;
     Component conditional_input = Maybe(input_peer_code, [&] { return !is_connecting; });
-    
+
     Component btn_toggle_local = Button(&toggle_btn_label, [&] {
         is_local_mode = !is_local_mode;
         toggle_btn_label = is_local_mode ? "Mode: Local Network (Bypass STUN)" : "Mode: Public Internet (Use STUN)";
@@ -986,7 +1115,7 @@ int main() {
 
         bottom_elements.push_back(text("") | size(HEIGHT, EQUAL, 1));
         bottom_elements.push_back(btn_connect_cancel->Render() | hcenter);
-        
+
         if (!is_connecting) {
             bottom_elements.push_back(btn_settings_conn_raw->Render() | size(WIDTH, EQUAL, 20) | hcenter);
         }
@@ -1017,10 +1146,10 @@ int main() {
     chat_input_option.multiline = false;
     chat_input_option.on_enter = [&] {
         if (!chat_input.empty()) {
-            
+
             // Queue the message to be sent over the reliable network
             enqueue_message(MessageType::TEXT_MESSAGE, chat_input);
-            
+
             // Show it locally
             api_add_chat_message("You", chat_input);
             chat_input.clear();
@@ -1065,16 +1194,16 @@ int main() {
             std::string percent_str = std::to_string(progress * 100);
             percent_str = percent_str.substr(0, percent_str.find('.') + 2); // keep 1 decimal
             std::string filename_str = fs::path(transfer.file_path).filename().string();
-            
+
             auto format_size = [](size_t bytes) {
                 if (bytes >= 1024ULL * 1024ULL * 1024ULL) return std::format("{:.2f} GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
                 if (bytes >= 1024 * 1024) return std::format("{:.2f} MB", (double)bytes / (1024.0 * 1024.0));
                 if (bytes >= 1024) return std::format("{:.2f} KB", (double)bytes / 1024.0);
                 return std::format("{} B", bytes);
             };
-            
+
             std::string stats_str = transfer.speed_text + "  -  " + format_size(transfer.current_size) + " / " + format_size(transfer.total_size);
-            
+
             elements.push_back(window(text(""), vbox({
                 text(filename_str) | bold,
                 text(stats_str),
@@ -1185,8 +1314,8 @@ int main() {
             } else {
                 if (explorer_mode == EXPLORER_SEND_FILE) {
                     std::string full_path = (fs::path(path_input) / selected_item).string();
-                    start_sending_file(full_path, selected_item);
-                    
+                    start_sending_item(full_path, selected_item);
+
                     last_confirmed_index = -1;
                     active_screen = file_dialog_previous_screen;
                 }
@@ -1205,7 +1334,7 @@ int main() {
                 std::string selected_item = current_directory_files[last_confirmed_index];
                 if (selected_item.back() == '/') selected_item.pop_back();
                 std::string full_path = (fs::path(path_input) / selected_item).string();
-                start_sending_file(full_path, selected_item);
+                start_sending_item(full_path, selected_item);
             }
         } else {
             std::string chosen_dir = path_input;
@@ -1338,30 +1467,30 @@ int main() {
     });
 
     screen.Loop(global_renderer);
-    
+
     // --- GRACEFUL SHUTDOWN: SEND DISCONNECT PACKET ---
     // This executes when the user clicks Exit Application, hits Escape, or uses Ctrl+C
     if (is_connecting && !peerInfo.ip.empty()) {
         try {
             std::vector<unsigned char> plaintext;
             plaintext.push_back(static_cast<uint8_t>(MessageType::DISCONNECT));
-            
+
             uint32_t seq;
             {
                 std::lock_guard<std::mutex> lock(queue_mutex);
                 seq = next_sequence_number++;
             }
-            
+
             plaintext.push_back((seq >> 24) & 0xFF);
             plaintext.push_back((seq >> 16) & 0xFF);
             plaintext.push_back((seq >> 8) & 0xFF);
             plaintext.push_back(seq & 0xFF);
-            
+
             std::vector<unsigned char> encrypted_payload = crypto::encrypt_data(plaintext, encryption_key);
-            
+
             asio::error_code send_ec;
             udp::endpoint peer_endp(asio::ip::make_address(peerInfo.ip), peerInfo.port);
-            
+
             // Blast it 3 times just to be absolutely sure they get it before we die, since we can't stick around to wait for an ACK
             for (int i = 0; i < 3; ++i) {
                 p2p_socket.send_to(asio::buffer(encrypted_payload), peer_endp, 0, send_ec);
