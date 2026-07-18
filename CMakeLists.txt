@@ -3,6 +3,9 @@ project(SendLighting)
 
 set(CMAKE_CXX_STANDARD 20)
 
+# Force static linking for dependencies
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Force static libraries" FORCE)
+
 include(FetchContent)
 
 # --- FTXUI ---
@@ -70,13 +73,16 @@ target_link_libraries(FileLighting
 if(WIN32)
     # 1. Link Windows networking libraries (Required for ASIO)
     target_link_libraries(FileLighting PRIVATE ws2_32 wsock32)
+endif()
 
-    # 2. Statically link C/C++ runtimes if using GCC/Clang
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_link_options(FileLighting PRIVATE
-                "-static"
-                "-static-libgcc"
-                "-static-libstdc++"
-        )
+# 2. Statically link C/C++ runtimes if using GCC/Clang
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_link_options(FileLighting PRIVATE
+            "-static-libgcc"
+            "-static-libstdc++"
+    )
+    # Fully static on Windows MinGW is safer than on Linux glibc
+    if(WIN32)
+        target_link_options(FileLighting PRIVATE "-static")
     endif()
 endif()
