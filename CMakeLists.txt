@@ -50,7 +50,7 @@ set(XXHASH_BUILD_XXHSUM OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
         xxhash
         GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
-        GIT_TAG        v0.8.2
+        GIT_TAG        v0.8.3
 )
 FetchContent_MakeAvailable(xxhash)
 
