@@ -44,6 +44,9 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(clip)
 
 # --- XXHASH ---
+
+set(XXHASH_BUILD_XXHSUM OFF CACHE BOOL "" FORCE)
+
 FetchContent_Declare(
         xxhash
         GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
