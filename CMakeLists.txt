@@ -43,6 +43,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(clip)
 
+# --- XXHASH ---
+FetchContent_Declare(
+        xxhash
+        GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
+        GIT_TAG        v0.8.2
+)
+FetchContent_MakeAvailable(xxhash)
+
 # --- Executable ---
 add_executable(FileLighting main.cpp crypto_utils.cpp)
 
@@ -53,6 +61,7 @@ target_link_libraries(FileLighting
         PRIVATE asio_lib
         PRIVATE sodium
         PRIVATE clip
+        PRIVATE xxhash
 )
 
 if(WIN32)

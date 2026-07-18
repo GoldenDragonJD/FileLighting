@@ -11,6 +11,7 @@
 #include <fstream>
 #include <thread>
 
+#include <xxhash.h>
 #include <asio.hpp>
 
 #include "crypto_utils.hpp"
@@ -25,8 +26,8 @@ using namespace ftxui;
 using asio::ip::udp;
 namespace fs = std::filesystem;
 
-constexpr size_t CHUNK_SIZE = 32768; // 32 KB per UDP packet (reduces syscalls by 32x)
-constexpr size_t BLOCK_CHUNKS = 128; // 4 MB blocks
+constexpr size_t CHUNK_SIZE = 1024; // 1 KB per UDP packet (reduces syscalls by 32x)
+constexpr size_t BLOCK_CHUNKS = 1024; // 1 MB blocks
 
 struct FileTransfer {
     uint32_t file_id{};
@@ -38,6 +39,7 @@ struct FileTransfer {
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point last_speed_update;
     size_t bytes_since_last_update = 0;
+    size_t dropped_packets = 0;
 };
 
 struct ActiveIncomingBlock {
@@ -292,9 +294,11 @@ int main() {
         if (offset >= block_data.size()) return;
 
         size_t size = std::min(CHUNK_SIZE, block_data.size() - offset);
+        
+        XXH64_hash_t hash = XXH3_64bits(block_data.data() + offset, size);
 
         std::vector<unsigned char> payload;
-        payload.reserve(12 + size);
+        payload.reserve(20 + size);
         payload.push_back((file_id >> 24) & 0xFF); payload.push_back((file_id >> 16) & 0xFF);
         payload.push_back((file_id >> 8) & 0xFF); payload.push_back(file_id & 0xFF);
 
@@ -303,6 +307,8 @@ int main() {
 
         payload.push_back((chunk_index >> 24) & 0xFF); payload.push_back((chunk_index >> 16) & 0xFF);
         payload.push_back((chunk_index >> 8) & 0xFF); payload.push_back(chunk_index & 0xFF);
+
+        for (int i = 0; i < 8; ++i) payload.push_back((hash >> (56 - i * 8)) & 0xFF);
 
         payload.insert(payload.end(), block_data.begin() + offset, block_data.begin() + offset + size);
         send_unreliable(MessageType::FILE_DATA_CHUNK, payload);
@@ -343,7 +349,7 @@ int main() {
 
             uint32_t batch_id = static_cast<uint32_t>(rand());
             auto now_t = std::chrono::steady_clock::now();
-            file_transfers[batch_id] = {batch_id, item_name, total_size, 0, "0.0 MB/s", now_t, now_t, 0};
+            file_transfers[batch_id] = {batch_id, item_name, total_size, 0, "0.0 MB/s", now_t, now_t, 0, 0};
 
             for (const auto& file_path : files) {
                 uint32_t file_id = static_cast<uint32_t>(rand());
@@ -373,7 +379,7 @@ int main() {
             uint32_t file_id = static_cast<uint32_t>(rand());
             uint32_t batch_id = file_id;
             auto now_t = std::chrono::steady_clock::now();
-            file_transfers[batch_id] = {batch_id, item_name, file_size, 0, "0.0 MB/s", now_t, now_t, 0};
+            file_transfers[batch_id] = {batch_id, item_name, file_size, 0, "0.0 MB/s", now_t, now_t, 0, 0};
             file_to_transfer[file_id] = batch_id;
 
             outgoing_transfers[file_id] = {std::make_shared<std::ifstream>(full_path, std::ios::binary), 0, file_size, 0};
@@ -643,10 +649,20 @@ int main() {
                             auto type = static_cast<MessageType>(decrypted_data[0]);
 
                             if (type == MessageType::FILE_DATA_CHUNK) {
-                                if (decrypted_data.size() >= 1 + 12) {
+                                if (decrypted_data.size() >= 1 + 20) {
                                     uint32_t file_id = (decrypted_data[1] << 24) | (decrypted_data[2] << 16) | (decrypted_data[3] << 8) | decrypted_data[4];
                                     uint32_t block_idx = (decrypted_data[5] << 24) | (decrypted_data[6] << 16) | (decrypted_data[7] << 8) | decrypted_data[8];
                                     uint32_t chunk_idx = (decrypted_data[9] << 24) | (decrypted_data[10] << 16) | (decrypted_data[11] << 8) | decrypted_data[12];
+                                    
+                                    uint64_t packet_hash = 0;
+                                    for(int i=0; i<8; ++i) packet_hash |= (static_cast<uint64_t>(decrypted_data[13 + i]) << (56 - i * 8));
+
+                                    size_t chunk_len = decrypted_data.size() - 21;
+                                    XXH64_hash_t computed_hash = XXH3_64bits(decrypted_data.data() + 21, chunk_len);
+
+                                    if (packet_hash != computed_hash) {
+                                        continue;
+                                    }
 
                                     if (incoming_transfers.count(file_id) && file_to_transfer.count(file_id)) {
                                         uint32_t batch_id = file_to_transfer[file_id];
@@ -654,10 +670,9 @@ int main() {
                                             auto& in_block = incoming_transfers[file_id];
                                             auto& ft = file_transfers[batch_id];
                                             if (block_idx == in_block.current_block && chunk_idx < in_block.chunk_received.size() && !in_block.chunk_received[chunk_idx]) {
-                                                size_t chunk_len = decrypted_data.size() - 13;
                                                 size_t offset = chunk_idx * CHUNK_SIZE;
                                                 if (offset + chunk_len <= in_block.full_block_data.size()) {
-                                                    std::copy(decrypted_data.begin() + 13, decrypted_data.end(), in_block.full_block_data.begin() + offset);
+                                                    std::copy(decrypted_data.begin() + 21, decrypted_data.end(), in_block.full_block_data.begin() + offset);
                                                 }
                                                 in_block.chunk_received[chunk_idx] = true;
 
@@ -793,7 +808,7 @@ int main() {
                                                         display_name = filename.substr(0, first_bslash);
                                                     }
                                                 }
-                                                file_transfers[batch_id] = {batch_id, display_name, batch_total_size, 0, "0.0 MB/s", now_t, now_t, 0};
+                                                file_transfers[batch_id] = {batch_id, display_name, batch_total_size, 0, "0.0 MB/s", now_t, now_t, 0, 0};
                                             }
 
                                             auto stream = std::make_shared<std::ofstream>(save_path, std::ios::binary);
@@ -909,6 +924,16 @@ int main() {
                                                     size_t bytes_read = out_transfer.stream->gcount();
                                                     if (bytes_read > 0) {
                                                         block_data.resize(bytes_read);
+                                                        
+                                                        // Update dropped packets metric
+                                                        if (file_to_transfer.count(file_id)) {
+                                                            uint32_t batch_id = file_to_transfer[file_id];
+                                                            if (file_transfers.count(batch_id)) {
+                                                                file_transfers[batch_id].dropped_packets += (payload.size() - 8) / 4;
+                                                                screen.PostEvent(Event::Custom);
+                                                            }
+                                                        }
+
                                                         for (size_t i = 8; i + 3 < payload.size(); i += 4) {
                                                             uint32_t missing_c = (static_cast<uint8_t>(payload[i]) << 24) | (static_cast<uint8_t>(payload[i+1]) << 16) | (static_cast<uint8_t>(payload[i+2]) << 8) | static_cast<uint8_t>(payload[i+3]);
                                                             blast_chunk(file_id, block_idx, missing_c, block_data);
@@ -1202,7 +1227,7 @@ int main() {
                 return std::format("{} B", bytes);
             };
 
-            std::string stats_str = transfer.speed_text + "  -  " + format_size(transfer.current_size) + " / " + format_size(transfer.total_size);
+            std::string stats_str = transfer.speed_text + "  -  " + format_size(transfer.current_size) + " / " + format_size(transfer.total_size) + " | Dropped: " + std::to_string(transfer.dropped_packets);
 
             elements.push_back(window(text(""), vbox({
                 text(filename_str) | bold,
