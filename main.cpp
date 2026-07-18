@@ -990,12 +990,15 @@ int main() {
                             nack_payload.push_back((block_idx >> 8) & 0xFF); nack_payload.push_back(block_idx & 0xFF);
 
                             bool missing_any = false;
+                            int nack_count = 0;
                             for (size_t i = 0; i < in_block.chunk_received.size(); ++i) {
                                 if (!in_block.chunk_received[i]) {
                                     missing_any = true;
                                     uint32_t c = i;
                                     nack_payload.push_back((c >> 24) & 0xFF); nack_payload.push_back((c >> 16) & 0xFF);
                                     nack_payload.push_back((c >> 8) & 0xFF); nack_payload.push_back(c & 0xFF);
+                                    nack_count++;
+                                    if (nack_count >= 250) break; // Prevent UDP fragmentation (keep packet under MTU)
                                 }
                             }
                             if (missing_any) {
@@ -1227,7 +1230,7 @@ int main() {
                 return std::format("{} B", bytes);
             };
 
-            std::string stats_str = transfer.speed_text + "  -  " + format_size(transfer.current_size) + " / " + format_size(transfer.total_size) + " | Dropped: " + std::to_string(transfer.dropped_packets);
+            std::string stats_str = transfer.speed_text + "  -  " + format_size(transfer.current_size) + " / " + format_size(transfer.total_size);
 
             elements.push_back(window(text(""), vbox({
                 text(filename_str) | bold,
@@ -1235,7 +1238,8 @@ int main() {
                 hbox({
                     gauge(progress) | flex,
                     text(" " + percent_str + "%")
-                })
+                }),
+                text("Dropped: " + std::to_string(transfer.dropped_packets)) | color(Color::Red)
             })));
         }
         if (elements.empty()) elements.push_back(text("No active transfers") | dim);
