@@ -6,9 +6,8 @@ import socket
 import struct
 import threading
 import time
+import zlib
 from random import randint, random
-
-import xxhash
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -171,7 +170,7 @@ def receive_response():
             file_data = response[17:]
             _, file_id, chunk_num, check_sum = struct.unpack("!B I I Q", header)
 
-            if check_sum != xxhash.xxh3_64_intdigest(file_data):
+            if check_sum != zlib.crc32(file_data):
                 print(
                     f"\n[Warning] Checksum mismatch on chunk {chunk_num}, dropping packet."
                 )
@@ -275,7 +274,7 @@ def receive_response():
                 chunk = file.read(CHUNK_SIZE)
                 # Pack with 1 to indicate it is binary data
                 header = struct.pack(
-                    "!B I I Q", 1, file_id, chunk_num, xxhash.xxh3_64_intdigest(chunk)
+                    "!B I I Q", 1, file_id, chunk_num, zlib.crc32(chunk)
                 )
                 s.sendto(header + chunk, (target_ip, target_port))
 
@@ -356,7 +355,7 @@ def sending_thread(file_id):
                 chunk = block_data[start_idx:end_idx]
 
                 header = struct.pack(
-                    "!B I I Q", 1, file_id, chunk_num, xxhash.xxh3_64_intdigest(chunk)
+                    "!B I I Q", 1, file_id, chunk_num, zlib.crc32(chunk)
                 )
                 s.sendto(header + chunk, (target_ip, target_port))
 
