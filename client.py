@@ -1,3 +1,4 @@
+import base64
 import json
 import math
 import os
@@ -16,9 +17,134 @@ target_ip = "172.104.105.130"
 
 pair_device_name = None
 request_device_name = None
+peer_connected = False
 
 sending_buffer = {}
 CHUNK_SIZE = 1024
+
+
+def copy_to_clipboard(text):
+    # Copy using OSC 52 escape sequence (works in modern terminals & over SSH)
+    b64_text = base64.b64encode(text.encode()).decode()
+    print(f"\033]52;c;{b64_text}\a", end="", flush=True)
+
+
+def fetch_public_endpoint(sock):
+    stun_servers = [
+        ("stun.l.google.com", 19302),
+        ("stun1.l.google.com", 19302),
+        ("stun.cloudflare.com", 3478),  # Excellent secondary fallback
+    ]
+
+    prev_timeout = sock.gettimeout()
+    sock.settimeout(2.0)
+    try:
+        for host, server_port in stun_servers:
+            try:
+                # 1. Resolve STUN server endpoint
+                addr_info = socket.getaddrinfo(
+                    host, server_port, socket.AF_INET, socket.SOCK_DGRAM
+                )
+                if not addr_info:
+                    continue
+                stun_endpoint = addr_info[0][4]
+
+                # 2. Construct the 20-byte STUN Binding Request packet manually
+                # Message Type: 0x0001 (Binding Request)
+                # Message Length: 0x0000 (No attributes)
+                # Magic Cookie: 0x2112A442
+                # Transaction ID: 12 random bytes
+                tx_id = os.urandom(12)
+                request = struct.pack("!HHI12s", 0x0001, 0x0000, 0x2112A442, tx_id)
+
+                # 3. Send the request
+                sock.sendto(request, stun_endpoint)
+
+                # 4. Read the response packet
+                recv_buffer, _ = sock.recvfrom(1024)
+                if len(recv_buffer) < 20:
+                    continue
+
+                # 5. Parse the STUN attributes to locate the XOR-MAPPED-ADDRESS (Type: 0x0020)
+                index = 20
+                length = len(recv_buffer)
+                while index + 4 <= length:
+                    attr_type, attr_len = struct.unpack(
+                        "!HH", recv_buffer[index : index + 4]
+                    )
+                    index += 4
+
+                    # Check if this attribute is the XOR-MAPPED-ADDRESS (0x0020)
+                    if attr_type == 0x0020 and index + attr_len <= length:
+                        # Byte 1: Protocol Family (0x01 for IPv4, 0x02 for IPv6)
+                        family = recv_buffer[index + 1]
+                        if family == 0x01:  # IPv4 Handling
+                            # The port is obfuscated by XORing it with the top 16 bits of the Magic Cookie
+                            xor_port = struct.unpack(
+                                "!H", recv_buffer[index + 2 : index + 4]
+                            )[0]
+                            actual_port = xor_port ^ 0x2112
+
+                            # The IP address is obfuscated by XORing it directly with the 32-bit Magic Cookie
+                            actual_ip = (
+                                ((recv_buffer[index + 4] ^ 0x21) << 24)
+                                | ((recv_buffer[index + 5] ^ 0x12) << 16)
+                                | ((recv_buffer[index + 6] ^ 0xA4) << 8)
+                                | (recv_buffer[index + 7] ^ 0x42)
+                            )
+
+                            ip_str = (
+                                f"{(actual_ip >> 24) & 0xFF}."
+                                f"{(actual_ip >> 16) & 0xFF}."
+                                f"{(actual_ip >> 8) & 0xFF}."
+                                f"{actual_ip & 0xFF}"
+                            )
+                            return ip_str, actual_port
+
+                    # STUN attributes are padded to multiples of 4 bytes
+                    index += (attr_len + 3) & ~3
+            except Exception as e:
+                print(f"[STUN] Error with {host}: {e}")
+                continue
+    finally:
+        sock.settimeout(prev_timeout)
+
+    return None
+
+
+def encode_stun_key(ip, port):
+    secure_key = f"{ip}:{port}"
+    return base64.urlsafe_b64encode(secure_key.encode()).decode()
+
+
+def decode_stun_key(peer_code):
+    peer_code = peer_code.strip()
+    if not peer_code:
+        return None
+
+    # Allow raw ip:port input as a fallback
+    if ":" in peer_code and all(c.isdigit() or c in ".:" for c in peer_code):
+        parts = peer_code.split(":")
+        try:
+            socket.inet_aton(parts[0])
+            return parts[0], int(parts[1])
+        except Exception:
+            pass
+
+    try:
+        padding = "=" * (-len(peer_code) % 4)
+        decoded = base64.urlsafe_b64decode(peer_code + padding).decode(
+            "utf-8", errors="ignore"
+        )
+        parts = decoded.split(":")
+        if len(parts) >= 2:
+            ip = parts[0]
+            port = int(parts[1])
+            socket.inet_aton(ip)
+            return ip, port
+    except Exception:
+        return None
+    return None
 
 
 def send_ping():
@@ -30,7 +156,7 @@ def send_ping():
 
 
 def receive_response():
-    global s, pair_device_name, request_device_name, target_ip, target_port
+    global s, pair_device_name, request_device_name, target_ip, target_port, peer_connected
     file_buffer = {}
 
     while True:
@@ -178,6 +304,30 @@ def receive_response():
             if file_id in sending_buffer:
                 sending_buffer[file_id]["ack"] = 1
 
+        elif data["type"] == "ping":
+            s.sendto(
+                json.dumps({"type": "ping_ack", "name": computer_name}).encode(),
+                addr,
+            )
+            if not peer_connected:
+                peer_connected = True
+                pair_device_name = data.get("name", "Peer")
+                print(
+                    f"\n[Hole Punch Successful! Connected to {pair_device_name} at {addr[0]}:{addr[1]}]\nEnter command: ",
+                    end="",
+                    flush=True,
+                )
+
+        elif data["type"] == "ping_ack":
+            if not peer_connected:
+                peer_connected = True
+                pair_device_name = data.get("name", "Peer")
+                print(
+                    f"\n[Hole Punch Successful! Connected to {pair_device_name} at {addr[0]}:{addr[1]}]\nEnter command: ",
+                    end="",
+                    flush=True,
+                )
+
 
 def sending_thread(file_id):
     global sending_buffer, s, target_ip, target_port
@@ -268,29 +418,63 @@ def sending_thread(file_id):
 
 # --- STARTUP AND CONNECTION ---
 computer_name = socket.gethostname() + str(math.floor(random() * 100))
-message = {"type": "connect", "name": computer_name}
 
-print("Connecting to Hub...")
-s.settimeout(2.0)
-connected = False
+# Bind to an ephemeral port to reuse for STUN and P2P communication
+s.bind(("0.0.0.0", 0))
 
-for attempt in range(5):
-    try:
-        s.sendto(json.dumps(message).encode(), (target_ip, target_port))
-        ack, addr = s.recvfrom(1024)
-        ack_data = json.loads(ack.decode())
-        if ack_data.get("type") == "connect_ack":
-            connected = True
-            break
-    except (socket.timeout, json.JSONDecodeError):
-        print(f"Attempt {attempt + 1} timed out...")
-
-if not connected:
-    print("No ack received from server. Exiting.")
+print("Fetching public endpoint via Google STUN...")
+endpoint = fetch_public_endpoint(s)
+if not endpoint:
+    print("Unable to reach STUN server. Exiting.")
     exit(1)
 
-print("Connected to Server successfully!")
-s.settimeout(None)
+public_ip, public_port = endpoint
+my_key = encode_stun_key(public_ip, public_port)
+copy_to_clipboard(my_key)
+
+print(f"Public Endpoint: {public_ip}:{public_port}")
+print("Share this STUN key with your peer (copy & paste):")
+print(f"\n{my_key}\n")
+
+# Keep NAT binding alive while waiting for the user to paste the peer's key
+waiting_for_peer_key = True
+stun_lock = threading.Lock()
+
+
+def stun_keepalive():
+    global my_key
+    while waiting_for_peer_key:
+        for _ in range(150):
+            if not waiting_for_peer_key:
+                return
+            time.sleep(0.1)
+        if waiting_for_peer_key:
+            with stun_lock:
+                if waiting_for_peer_key:
+                    refreshed = fetch_public_endpoint(s)
+                    if refreshed:
+                        new_key = encode_stun_key(refreshed[0], refreshed[1])
+                        if new_key != my_key:
+                            my_key = new_key
+                            copy_to_clipboard(my_key)
+                            print(f"\n[STUN key updated]: {my_key}\nPaste peer STUN key: ", end="", flush=True)
+
+
+threading.Thread(target=stun_keepalive, daemon=True).start()
+
+while True:
+    peer_input = input("Paste peer STUN key: ").strip()
+    parsed = decode_stun_key(peer_input)
+    if parsed:
+        target_ip, target_port = parsed
+        break
+    print("Invalid key format. Please paste a valid base64 STUN key (or IP:Port).")
+
+waiting_for_peer_key = False
+with stun_lock:
+    s.settimeout(None)
+
+print(f"Connecting to peer at {target_ip}:{target_port} (punching UDP hole)...")
 
 threading.Thread(target=send_ping, daemon=True).start()
 threading.Thread(target=receive_response, daemon=True).start()
