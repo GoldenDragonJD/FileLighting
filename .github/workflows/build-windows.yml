@@ -9,6 +9,8 @@ on:
 jobs:
   build-windows:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -38,3 +40,25 @@ jobs:
           name: FileLighting-windows-x64
           path: build-windows/FileLighting.exe
           if-no-files-found: error
+
+      - name: Publish FileLighting.exe to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "${{ github.sha }}"
+          git push -f origin refs/tags/latest
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest build-windows/FileLighting.exe --clobber
+            gh release edit latest \
+              --title "Latest Windows Build (${GITHUB_SHA::7})" \
+              --notes "Automated Windows build of \`FileLighting.exe\` from commit ${GITHUB_SHA}." \
+              --latest
+          else
+            gh release create latest build-windows/FileLighting.exe \
+              --title "Latest Windows Build (${GITHUB_SHA::7})" \
+              --notes "Automated Windows build of \`FileLighting.exe\` from commit ${GITHUB_SHA}." \
+              --latest
+          fi
+
