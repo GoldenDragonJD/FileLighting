@@ -1,0 +1,40 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 and Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 ninja-build
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+
+      - name: Configure CMake (Windows MinGW-w64)
+        run: |
+          cmake -B build-windows -S . \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=mingw-toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build FileLighting.exe
+        run: |
+          cmake --build build-windows --config Release --parallel
+
+      - name: Upload FileLighting.exe Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileLighting-windows-x64
+          path: build-windows/FileLighting.exe
+          if-no-files-found: error
